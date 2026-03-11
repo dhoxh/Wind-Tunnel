@@ -18,7 +18,15 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .insert_resource(grid::Grid::new(grid::GRID_WIDTH, grid::GRID_HEIGHT))
         .add_systems(Startup, (setup, seed_density))
-        .add_systems(Update, (camera_movement, camera_zoom, update_cell_colors))
+        .add_systems(
+            Update,
+            (
+                camera_movement,
+                camera_zoom,
+                step_density,
+                update_cell_colors,
+            ),
+        )
         .run();
 }
 
@@ -56,6 +64,31 @@ fn seed_density(mut grid: ResMut<grid::Grid>) {
         let index = center_row * grid.width + col;
         grid.density[index] = 1.0;
     }
+}
+
+fn step_density(mut grid: ResMut<grid::Grid>) {
+    let mut new_density = vec![0.0; grid.width * grid.height];
+
+    // shift everything right by 1 cell (simple transport)
+    for row in 0..grid.height {
+        for col in 0..grid.width {
+            let index = row * grid.width + col;
+
+            if col > 0 {
+                let left_index = row * grid.width + (col - 1);
+                new_density[index] = grid.density[left_index] * 0.98; // a little decay
+            }
+        }
+    }
+
+    // inject fresh density on the left edge around the center
+    let center_row = grid.height / 2;
+    for row in center_row.saturating_sub(1)..=(center_row + 1).min(grid.height - 1) {
+        let index = row * grid.width; // col = 0
+        new_density[index] = 1.0;
+    }
+
+    grid.density = new_density;
 }
 
 fn camera_movement(
