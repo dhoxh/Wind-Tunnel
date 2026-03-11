@@ -1,31 +1,34 @@
 use bevy::prelude::*;
 
-pub const GRID_WIDTH: usize = 10;
-pub const GRID_HEIGHT: usize = 10;
-pub const CELL_SIZE: f32 = 40.0;
+pub const GRID_WIDTH: usize = 12;
+pub const GRID_HEIGHT: usize = 8;
+pub const GRID_DEPTH: usize = 8;
+pub const CELL_SIZE: f32 = 0.8;
 
 #[derive(Resource)]
-pub struct Grid {
+pub struct Grid3D {
     pub width: usize,
     pub height: usize,
+    pub depth: usize,
 
-    pub velocity_x: Vec<f32>,
-    pub velocity_y: Vec<f32>,
-    pub pressure: Vec<f32>,
     pub density: Vec<f32>,
+    pub solid: Vec<bool>,
 }
 
-impl Grid {
-    pub fn new(width: usize, height: usize) -> Self {
-        let size = width * height;
+impl Grid3D {
+    pub fn new(width: usize, height: usize, depth: usize) -> Self {
+        let size = width * height * depth;
 
         Self {
             width,
             height,
-            velocity_x: vec![0.0; size],
-            velocity_y: vec![0.0; size],
-            pressure: vec![0.0; size],
+            depth,
             density: vec![0.0; size],
+            solid: vec![false; size],
         }
+    }
+
+    pub fn index(&self, x: usize, y: usize, z: usize) -> usize {
+        z * self.width * self.height + y * self.width + x
     }
 }

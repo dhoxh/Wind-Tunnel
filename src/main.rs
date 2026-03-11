@@ -1,150 +1,48 @@
-use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
-mod fluid;
-mod geometry;
-mod grid;
-mod renderer;
-
-#[derive(Component)]
-struct MainCamera;
-
-#[derive(Component)]
-struct Cell {
-    index: usize,
-}
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .insert_resource(grid::Grid::new(grid::GRID_WIDTH, grid::GRID_HEIGHT))
-        .add_systems(Startup, (setup, seed_density))
-        .add_systems(
-            Update,
-            (
-                camera_movement,
-                camera_zoom,
-                step_density,
-                update_cell_colors,
-            ),
-        )
+        .add_systems(Startup, setup_3d)
         .run();
 }
 
-fn setup(mut commands: Commands, grid: Res<grid::Grid>) {
-    commands.spawn((Camera2d, MainCamera));
-
-    let total_width = grid.width as f32 * grid::CELL_SIZE;
-    let total_height = grid.height as f32 * grid::CELL_SIZE;
-
-    let start_x = -total_width / 2.0 + grid::CELL_SIZE / 2.0;
-    let start_y = -total_height / 2.0 + grid::CELL_SIZE / 2.0;
-
-    for row in 0..grid.height {
-        for col in 0..grid.width {
-            let x = start_x + col as f32 * grid::CELL_SIZE;
-            let y = start_y + row as f32 * grid::CELL_SIZE;
-            let index = row * grid.width + col;
-
-            commands.spawn((
-                Cell { index },
-                Sprite::from_color(
-                    Color::srgb(0.2, 0.4, 0.8),
-                    Vec2::splat(grid::CELL_SIZE - 2.0),
-                ),
-                Transform::from_xyz(x, y, 0.0),
-            ));
-        }
-    }
-}
-
-fn seed_density(mut grid: ResMut<grid::Grid>) {
-    let center_row = grid.height / 2;
-
-    for col in 0..3 {
-        let index = center_row * grid.width + col;
-        grid.density[index] = 1.0;
-    }
-}
-
-fn step_density(mut grid: ResMut<grid::Grid>) {
-    let mut new_density = vec![0.0; grid.width * grid.height];
-
-    // shift everything right by 1 cell (simple transport)
-    for row in 0..grid.height {
-        for col in 0..grid.width {
-            let index = row * grid.width + col;
-
-            if col > 0 {
-                let left_index = row * grid.width + (col - 1);
-                new_density[index] = grid.density[left_index] * 0.98; // a little decay
-            }
-        }
-    }
-
-    // inject fresh density on the left edge around the center
-    let center_row = grid.height / 2;
-    for row in center_row.saturating_sub(1)..=(center_row + 1).min(grid.height - 1) {
-        let index = row * grid.width; // col = 0
-        new_density[index] = 1.0;
-    }
-
-    grid.density = new_density;
-}
-
-fn camera_movement(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    mut query: Query<&mut Transform, With<MainCamera>>,
+fn setup_3d(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let Ok(mut transform) = query.single_mut() else {
-        return;
-    };
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(-12.0, 10.0, 18.0).looking_at(Vec3::new(0.0, 3.0, 0.0), Vec3::Y),
+    ));
 
-    let mut direction = Vec3::ZERO;
-    let speed = 500.0;
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 12000.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, -0.8, 0.0)),
+    ));
 
-    if keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp) {
-        direction.y += 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown) {
-        direction.y -= 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft) {
-        direction.x -= 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
-        direction.x += 1.0;
-    }
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(30.0, 30.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.15, 0.15, 0.17),
+            perceptual_roughness: 0.9,
+            ..default()
+        })),
+        Transform::default(),
+    ));
 
-    if direction != Vec3::ZERO {
-        transform.translation += direction.normalize() * speed * time.delta_secs();
-    }
-}
-
-fn camera_zoom(
-    mut mouse_wheel_events: MessageReader<MouseWheel>,
-    mut query: Query<&mut Projection, With<MainCamera>>,
-) {
-    let Ok(mut projection) = query.single_mut() else {
-        return;
-    };
-
-    if let Projection::Orthographic(ref mut ortho) = *projection {
-        for event in mouse_wheel_events.read() {
-            ortho.scale -= event.y * 0.1;
-            ortho.scale = ortho.scale.clamp(0.2, 5.0);
-        }
-    }
-}
-
-fn update_cell_colors(grid: Res<grid::Grid>, mut query: Query<(&Cell, &mut Sprite)>) {
-    for (cell, mut sprite) in &mut query {
-        let density = grid.density[cell.index].clamp(0.0, 1.0);
-
-        sprite.color = Color::srgb(
-            0.1 + density * 0.9,
-            0.2 + density * 0.3,
-            0.8 - density * 0.6,
-        );
-    }
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(4.0, 4.0, 4.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.35, 0.35, 0.38),
+            perceptual_roughness: 0.95,
+            ..default()
+        })),
+        Transform::from_xyz(0.0, 2.0, 0.0),
+    ));
 }
