@@ -1,6 +1,7 @@
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
-
+use bevy::window::PresentMode;
 mod grid;
 
 #[derive(Component)]
@@ -16,17 +17,30 @@ struct FlyCamera {
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins)
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                present_mode: PresentMode::AutoVsync,
+                ..default()
+            }),
+            ..default()
+        }))
         .insert_resource(grid::Grid3D::new(
             grid::GRID_WIDTH,
             grid::GRID_HEIGHT,
             grid::GRID_DEPTH,
         ))
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_systems(
             Startup,
-            (setup_3d, seed_cube_obstacle, spawn_voxel_obstacle).chain(),
+            (
+                setup_3d,
+                seed_cube_obstacle,
+                spawn_voxel_obstacle,
+                spawn_fps_counter,
+            )
+                .chain(),
         )
-        .add_systems(Update, (camera_look, camera_move))
+        .add_systems(Update, (camera_look, camera_move, update_fps))
         .run();
 }
 
@@ -200,5 +214,37 @@ fn camera_move(
 
     if movement != Vec3::ZERO {
         transform.translation += movement.normalize() * camera.speed * time.delta_secs();
+    }
+}
+#[derive(Component)]
+struct FpsText;
+
+fn spawn_fps_counter(mut commands: Commands) {
+    commands.spawn((
+        Text::new("FPS: "),
+        TextFont {
+            font_size: 16.0,
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(10.0),
+            top: Val::Px(10.0),
+            ..default()
+        },
+        FpsText,
+    ));
+}
+fn update_fps(diagnostics: Res<DiagnosticsStore>, mut query: Query<&mut Text, With<FpsText>>) {
+    let Ok(mut text) = query.single_mut() else {
+        return;
+    };
+
+    if let Some(fps) = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|d| d.smoothed())
+    {
+        *text = Text::new(format!("FPS: {:.0}", fps));
     }
 }
