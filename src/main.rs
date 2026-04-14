@@ -137,8 +137,6 @@ fn spawn_voxel_obstacle(
                     let world_y = y_offset + y as f32 * grid::CELL_SIZE;
                     let world_z = z_offset + z as f32 * grid::CELL_SIZE;
 
-                    println!("spawning voxel at ({x}, {y}, {z})");
-
                     commands.spawn((
                         Voxel,
                         Mesh3d(voxel_mesh.clone()),
