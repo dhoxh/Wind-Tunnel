@@ -2,7 +2,15 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
 use bevy::window::PresentMode;
+
+mod fluid;
+mod geometry;
 mod grid;
+mod renderer;
+
+use fluid::FluidSim;
+use geometry::{ImportRequest, ObstacleViz};
+use renderer::VizSettings;
 
 #[derive(Component)]
 struct Voxel;
@@ -15,10 +23,15 @@ struct FlyCamera {
     sensitivity: f32,
 }
 
+/// Request flag: rebuild the default cube obstacle (used to clear an import).
+#[derive(Resource, Default)]
+struct ResetObstacleRequest(bool);
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
+                title: "RustFlow — Interactive Wind Tunnel".into(),
                 present_mode: PresentMode::AutoVsync,
                 ..default()
             }),
@@ -29,6 +42,14 @@ fn main() {
             grid::GRID_HEIGHT,
             grid::GRID_DEPTH,
         ))
+        .insert_resource(FluidSim::new(
+            grid::GRID_WIDTH,
+            grid::GRID_HEIGHT,
+            grid::GRID_DEPTH,
+        ))
+        .init_resource::<VizSettings>()
+        .init_resource::<ImportRequest>()
+        .init_resource::<ResetObstacleRequest>()
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_systems(
             Startup,
@@ -36,11 +57,28 @@ fn main() {
                 setup_3d,
                 seed_cube_obstacle,
                 spawn_voxel_obstacle,
+                renderer::setup_particles,
                 spawn_fps_counter,
+                spawn_hud,
             )
                 .chain(),
         )
-        .add_systems(Update, (camera_look, camera_move, update_fps))
+        .add_systems(
+            Update,
+            (
+                camera_look,
+                camera_move,
+                update_fps,
+                handle_controls,
+                step_fluid,
+                renderer::update_particles,
+                geometry::handle_import_request,
+                geometry::process_pending_import,
+                handle_reset_obstacle,
+                toggle_obstacle_visibility,
+                update_hud,
+            ),
+        )
         .run();
 }
 
@@ -51,11 +89,11 @@ fn setup_3d(
 ) {
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(-12.0, 10.0, 18.0).looking_at(Vec3::new(0.0, 3.0, 0.0), Vec3::Y),
+        Transform::from_xyz(-18.0, 12.0, 22.0).looking_at(Vec3::new(0.0, 4.0, 0.0), Vec3::Y),
         FlyCamera {
             yaw: -0.6,
             pitch: -0.35,
-            speed: 8.0,
+            speed: 12.0,
             sensitivity: 0.003,
         },
     ));
@@ -70,34 +108,26 @@ fn setup_3d(
     ));
 
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(30.0, 30.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(60.0, 60.0))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.15, 0.15, 0.17),
+            base_color: Color::srgb(0.12, 0.12, 0.14),
             perceptual_roughness: 0.9,
             ..default()
         })),
         Transform::default(),
     ));
-
-    // commands.spawn((
-    //    Mesh3d(meshes.add(Cuboid::new(4.0, 4.0, 4.0))),
-    //    MeshMaterial3d(materials.add(StandardMaterial {
-    //        base_color: Color::srgb(0.35, 0.35, 0.38),
-    //        perceptual_roughness: 0.95,
-    //        ..default()
-    //    })),
-    //    Transform::from_xyz(0.0, 2.0, 0.0),
-    //));
 }
 
+/// Seed the default block obstacle into the solid grid.
 fn seed_cube_obstacle(mut grid: ResMut<grid::Grid3D>) {
-    let center_x = grid.width / 2;
-    let center_y = grid.height / 2;
-    let center_z = grid.depth / 2;
+    let cx = grid.width / 3;
+    let cy = grid.height / 2;
+    let cz = grid.depth / 2;
+    let r = 3;
 
-    for z in (center_z - 1)..=(center_z + 1) {
-        for y in (center_y - 1)..=(center_y + 1) {
-            for x in (center_x - 1)..=(center_x + 1) {
+    for z in cz.saturating_sub(r)..=(cz + r).min(grid.depth - 1) {
+        for y in cy.saturating_sub(r)..=(cy + r).min(grid.height - 1) {
+            for x in cx.saturating_sub(r)..=(cx + r).min(grid.width - 1) {
                 let idx = grid.index(x, y, z);
                 grid.density[idx] = 1.0;
                 grid.solid[idx] = true;
@@ -105,6 +135,8 @@ fn seed_cube_obstacle(mut grid: ResMut<grid::Grid3D>) {
         }
     }
 }
+
+/// Render one red cube per solid cell (only used for the default obstacle).
 fn spawn_voxel_obstacle(
     mut commands: Commands,
     grid: Res<grid::Grid3D>,
@@ -112,9 +144,9 @@ fn spawn_voxel_obstacle(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let voxel_mesh = meshes.add(Cuboid::new(
-        grid::CELL_SIZE * 1.0,
-        grid::CELL_SIZE * 1.0,
-        grid::CELL_SIZE * 1.0,
+        grid::CELL_SIZE,
+        grid::CELL_SIZE,
+        grid::CELL_SIZE,
     ));
 
     let voxel_material = materials.add(StandardMaterial {
@@ -123,31 +155,151 @@ fn spawn_voxel_obstacle(
         ..default()
     });
 
-    let x_offset = -(grid.width as f32 * grid::CELL_SIZE) / 2.0;
-    let y_offset = 0.5;
-    let z_offset = -(grid.depth as f32 * grid::CELL_SIZE) / 2.0;
-
     for z in 0..grid.depth {
         for y in 0..grid.height {
             for x in 0..grid.width {
                 let i = grid.index(x, y, z);
-
                 if grid.solid[i] {
-                    let world_x = x_offset + x as f32 * grid::CELL_SIZE;
-                    let world_y = y_offset + y as f32 * grid::CELL_SIZE;
-                    let world_z = z_offset + z as f32 * grid::CELL_SIZE;
-
                     commands.spawn((
                         Voxel,
+                        ObstacleViz,
                         Mesh3d(voxel_mesh.clone()),
                         MeshMaterial3d(voxel_material.clone()),
-                        Transform::from_xyz(world_x, world_y, world_z),
+                        Transform::from_translation(grid.cell_to_world(x, y, z)),
                     ));
                 }
             }
         }
     }
 }
+
+/// Advance the Navier–Stokes solver each frame.
+fn step_fluid(mut sim: ResMut<FluidSim>, grid: Res<grid::Grid3D>, time: Res<Time>) {
+    let dt = time.delta_secs();
+    sim.step(&grid, dt);
+}
+
+/// Keyboard controls for the simulation and visualization toggles.
+fn handle_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut sim: ResMut<FluidSim>,
+    mut viz: ResMut<VizSettings>,
+    mut import: ResMut<ImportRequest>,
+    mut reset_obstacle: ResMut<ResetObstacleRequest>,
+) {
+    if keys.just_pressed(KeyCode::Enter) {
+        sim.running = !sim.running;
+    }
+    if keys.just_pressed(KeyCode::KeyR) {
+        sim.reset();
+    }
+    if keys.just_pressed(KeyCode::BracketRight) {
+        sim.wind_speed = (sim.wind_speed + 1.0).min(25.0);
+    }
+    if keys.just_pressed(KeyCode::BracketLeft) {
+        sim.wind_speed = (sim.wind_speed - 1.0).max(0.0);
+    }
+    if keys.just_pressed(KeyCode::Period) {
+        sim.viscosity = (sim.viscosity + 0.1).min(5.0);
+    }
+    if keys.just_pressed(KeyCode::Comma) {
+        sim.viscosity = (sim.viscosity - 0.1).max(0.0);
+    }
+    if keys.just_pressed(KeyCode::KeyP) {
+        viz.show_particles = !viz.show_particles;
+    }
+    if keys.just_pressed(KeyCode::KeyB) {
+        viz.show_obstacle = !viz.show_obstacle;
+    }
+    if keys.just_pressed(KeyCode::KeyC) {
+        viz.color_by_speed = !viz.color_by_speed;
+    }
+    if keys.just_pressed(KeyCode::KeyO) {
+        import.0 = true;
+    }
+    if keys.just_pressed(KeyCode::KeyX) {
+        reset_obstacle.0 = true;
+    }
+}
+
+/// Rebuild the default cube obstacle when the user clears an imported model.
+fn handle_reset_obstacle(
+    mut request: ResMut<ResetObstacleRequest>,
+    mut commands: Commands,
+    mut grid: ResMut<grid::Grid3D>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    obstacles: Query<Entity, With<ObstacleViz>>,
+) {
+    if !request.0 {
+        return;
+    }
+    request.0 = false;
+
+    for e in &obstacles {
+        commands.entity(e).despawn();
+    }
+    grid.clear_solids();
+
+    // Re-seed and re-render the default block.
+    let cx = grid.width / 3;
+    let cy = grid.height / 2;
+    let cz = grid.depth / 2;
+    let r = 3;
+    for z in cz.saturating_sub(r)..=(cz + r).min(grid.depth - 1) {
+        for y in cy.saturating_sub(r)..=(cy + r).min(grid.height - 1) {
+            for x in cx.saturating_sub(r)..=(cx + r).min(grid.width - 1) {
+                let idx = grid.index(x, y, z);
+                grid.solid[idx] = true;
+            }
+        }
+    }
+
+    let voxel_mesh = meshes.add(Cuboid::new(
+        grid::CELL_SIZE,
+        grid::CELL_SIZE,
+        grid::CELL_SIZE,
+    ));
+    let voxel_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.8, 0.2, 0.2),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+    for z in 0..grid.depth {
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                let i = grid.index(x, y, z);
+                if grid.solid[i] {
+                    commands.spawn((
+                        Voxel,
+                        ObstacleViz,
+                        Mesh3d(voxel_mesh.clone()),
+                        MeshMaterial3d(voxel_material.clone()),
+                        Transform::from_translation(grid.cell_to_world(x, y, z)),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Apply the obstacle show/hide toggle to all obstacle entities.
+fn toggle_obstacle_visibility(
+    viz: Res<VizSettings>,
+    mut query: Query<&mut Visibility, With<ObstacleViz>>,
+) {
+    let target = if viz.show_obstacle {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in &mut query {
+        if *v != target {
+            *v = target;
+        }
+    }
+}
+
 fn camera_look(
     mut mouse_motion_events: MessageReader<MouseMotion>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -175,6 +327,7 @@ fn camera_look(
 
     transform.rotation = Quat::from_rotation_y(camera.yaw) * Quat::from_rotation_x(camera.pitch);
 }
+
 fn camera_move(
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
@@ -214,6 +367,7 @@ fn camera_move(
         transform.translation += movement.normalize() * camera.speed * time.delta_secs();
     }
 }
+
 #[derive(Component)]
 struct FpsText;
 
@@ -234,6 +388,7 @@ fn spawn_fps_counter(mut commands: Commands) {
         FpsText,
     ));
 }
+
 fn update_fps(diagnostics: Res<DiagnosticsStore>, mut query: Query<&mut Text, With<FpsText>>) {
     let Ok(mut text) = query.single_mut() else {
         return;
@@ -245,4 +400,50 @@ fn update_fps(diagnostics: Res<DiagnosticsStore>, mut query: Query<&mut Text, Wi
     {
         *text = Text::new(format!("FPS: {:.0}", fps));
     }
+}
+
+#[derive(Component)]
+struct HudText;
+
+fn spawn_hud(mut commands: Commands) {
+    commands.spawn((
+        Text::new(""),
+        TextFont {
+            font_size: 15.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.85, 0.9, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(10.0),
+            top: Val::Px(10.0),
+            ..default()
+        },
+        HudText,
+    ));
+}
+
+fn update_hud(
+    sim: Res<FluidSim>,
+    viz: Res<VizSettings>,
+    mut query: Query<&mut Text, With<HudText>>,
+) {
+    let Ok(mut text) = query.single_mut() else {
+        return;
+    };
+    let on = |b: bool| if b { "ON" } else { "OFF" };
+    *text = Text::new(format!(
+        "RustFlow — Wind Tunnel\n\
+         Wind speed: {:.1} m/s   ( [ / ] )      Viscosity: {:.1}   ( , / . )\n\
+         Simulation: {}   (Enter)    Reset flow: R\n\
+         Particles: {} (P)   Obstacle: {} (B)   Color-by-speed: {} (C)\n\
+         O: import 3D model (GLB/glTF)    X: restore default block\n\
+         Camera: WASD move, Space/Shift up-down, hold Left-Mouse to look",
+        sim.wind_speed,
+        sim.viscosity,
+        if sim.running { "RUNNING" } else { "PAUSED" },
+        on(viz.show_particles),
+        on(viz.show_obstacle),
+        on(viz.color_by_speed),
+    ));
 }
