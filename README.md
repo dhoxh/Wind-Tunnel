@@ -5,6 +5,23 @@ It allows users to import 3D models (GLB / glTF) and observe real-time, physical
 
 This project focuses on interactive simulation and visual intuition rather than engineering-grade CFD accuracy.
 
+> See **[WINDFLOW.md](WINDFLOW.md)** for a full description of the Navier–Stokes
+> wind-flow simulation, how it works, and the keyboard controls.
+
+## Quick start
+
+```bash
+cargo run --release
+```
+
+Press **O** to import a `.glb`/`.gltf` model (e.g. from Sketchfab) into the
+tunnel, use `[` / `]` to change wind speed, and `P` / `B` / `C` to toggle the
+particles, obstacle, and speed coloring. The full control list is in
+[WINDFLOW.md](WINDFLOW.md).
+
+On Linux, building Bevy needs `libasound2-dev`, `libudev-dev`, and
+`libxkbcommon-dev`; macOS and Windows need nothing extra.
+
 ## Features
 
 - Drag-and-drop 3D model support (GLB / glTF)

@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 bevy = "0.18"
+# Portal backend avoids GTK system build-deps for the native file picker.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }
+
+# On Linux, force wayland-sys to load libwayland at runtime (dlopen) instead of
+# linking it via pkg-config, so the build needs no system wayland dev packages.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-sys = { version = "0.31", features = ["dlopen"] }
