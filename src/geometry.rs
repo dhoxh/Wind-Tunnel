@@ -16,7 +16,9 @@ use bevy::mesh::{Indices, VertexAttributeValues};
 use bevy::prelude::*;
 use bevy::scene::SceneRoot;
 
-use crate::grid::{Grid3D, CELL_SIZE, REF_HEIGHT_MM};
+use bevy::asset::LoadState;
+
+use crate::grid::{Grid3D, CELL_SIZE, WORLD_PER_MM};
 use crate::Config;
 
 /// Marker for anything that counts as "the obstacle" for the show/hide toggle:
@@ -32,6 +34,7 @@ pub struct ImportRequest(pub bool);
 #[derive(Resource)]
 pub struct PendingLoad {
     root: Entity,
+    scene: Handle<Scene>,
 }
 
 /// A loaded model, with everything needed to (re)seat and (re)voxelize it from
@@ -95,13 +98,13 @@ pub fn handle_import_request(
     let root = commands
         .spawn((
             ObstacleViz,
-            SceneRoot(scene),
+            SceneRoot(scene.clone()),
             Transform::default(),
             Visibility::default(),
         ))
         .id();
 
-    commands.insert_resource(PendingLoad { root });
+    commands.insert_resource(PendingLoad { root, scene });
 }
 
 /// Once the spawned scene's meshes are available, compute its bounds and fit
@@ -109,6 +112,7 @@ pub fn handle_import_request(
 pub fn process_loading(
     mut commands: Commands,
     pending: Option<Res<PendingLoad>>,
+    asset_server: Res<AssetServer>,
     grid: Res<Grid3D>,
     config: Res<Config>,
     meshes: Res<Assets<Mesh>>,
@@ -118,6 +122,15 @@ pub fn process_loading(
     let Some(pending) = pending else {
         return;
     };
+
+    // If the asset failed to load (corrupt / empty file), clean up so the user
+    // can immediately try another import instead of being stuck.
+    if let LoadState::Failed(err) = asset_server.load_state(&pending.scene) {
+        error!("Model failed to load: {err}");
+        commands.entity(pending.root).despawn();
+        commands.remove_resource::<PendingLoad>();
+        return;
+    }
 
     let entries = collect_meshes(pending.root, &children_q, &mesh_q, &meshes);
     if entries.is_empty() {
@@ -173,8 +186,7 @@ pub fn apply_placement(
         let s = placement.scale;
         let rot = Quat::from_rotation_y(config.model_yaw_deg.to_radians());
 
-        let height_world = (placement.bbox_max.y - placement.bbox_min.y) * s;
-        let gap = (config.ride_height_mm / REF_HEIGHT_MM) * height_world;
+        let gap = config.ride_height_mm * WORLD_PER_MM;
 
         let centroid = (placement.bbox_min + placement.bbox_max) * 0.5;
         let rc = rot * centroid;
@@ -333,11 +345,31 @@ fn pick_model_file() -> Option<PathBuf> {
 /// Stage the picked model into `assets/imported/`. A `.glb` is self-contained;
 /// a `.gltf` references sibling files, so we copy its whole folder.
 fn stage_into_assets(src: &std::path::Path) -> std::io::Result<String> {
+    // Reject empty / unreadable picks up front with a clear message, rather than
+    // letting the glTF loader fail later with a cryptic "EOF" error.
+    let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "selected file is empty (0 bytes) — the download likely failed; \
+             re-download the model as glTF Binary (.glb)",
+        ));
+    }
+    info!("Selected model is {:.2} MB", size as f64 / 1.0e6);
+
     let file_name = src
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "model.glb".to_string());
     let dest_root = std::path::Path::new("assets/imported");
+
+    // If the picked file already lives under `assets/`, load it in place. This
+    // avoids a `fs::copy` of a file onto itself (which would truncate it to 0
+    // bytes) when the user selects something already inside the asset folder.
+    if let Some(rel) = path_within_assets(src) {
+        info!("Model is already under assets/, loading in place: {rel}");
+        return Ok(rel);
+    }
 
     let is_gltf = src
         .extension()
@@ -359,6 +391,15 @@ fn stage_into_assets(src: &std::path::Path) -> std::io::Result<String> {
         std::fs::copy(src, &dest)?;
         Ok(format!("imported/{file_name}"))
     }
+}
+
+/// If `src` resolves to a path inside the `assets/` directory, return the
+/// AssetServer-relative path (forward-slashed); otherwise `None`.
+fn path_within_assets(src: &std::path::Path) -> Option<String> {
+    let assets = std::fs::canonicalize("assets").ok()?;
+    let src = std::fs::canonicalize(src).ok()?;
+    let rel = src.strip_prefix(&assets).ok()?;
+    Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// Recursively copy a directory tree.

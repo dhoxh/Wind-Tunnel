@@ -13,7 +13,7 @@ mod renderer;
 
 use fluid::FluidSim;
 use geometry::{ImportRequest, ModelPlacement, ObstacleViz, PendingLoad};
-use grid::{CELL_SIZE, REF_HEIGHT_MM};
+use grid::{CELL_SIZE, MM_PER_CELL};
 use renderer::VizSettings;
 
 #[derive(Component)]
@@ -35,6 +35,9 @@ pub struct Config {
     /// Model heading about the vertical axis, in degrees. The default faces the
     /// model into the oncoming wind.
     pub model_yaw_deg: f32,
+    /// Streamlines are only seeded up to this height above the ground, in mm,
+    /// so the wind reads as a sensible band instead of filling the whole domain.
+    pub max_wind_height_mm: f32,
     /// Frame-rate cap; `0` means uncapped. VSync is off so this governs pacing.
     pub fps_cap: f32,
 }
@@ -44,6 +47,7 @@ impl Default for Config {
         Self {
             ride_height_mm: 40.0,
             model_yaw_deg: -90.0,
+            max_wind_height_mm: 500.0,
             fps_cap: 144.0,
         }
     }
@@ -171,9 +175,7 @@ fn build_cube(
     materials: &mut Assets<StandardMaterial>,
     ride_mm: f32,
 ) {
-    let cube_h_world = CUBE_CELLS as f32 * CELL_SIZE;
-    let gap_world = (ride_mm / REF_HEIGHT_MM) * cube_h_world;
-    let start_y = (gap_world / CELL_SIZE).round() as usize;
+    let start_y = (ride_mm / MM_PER_CELL).round() as usize;
 
     let cx = grid.width / 3;
     let cz = grid.depth / 2;
@@ -368,6 +370,10 @@ fn settings_ui(
             ui.checkbox(&mut viz.color_by_speed, "Color by speed");
             ui.checkbox(&mut viz.show_obstacle, "Show obstacle");
             ui.add(egui::Slider::new(&mut viz.density, 4..=24).text("Streamline density"));
+            ui.add(
+                egui::Slider::new(&mut config.max_wind_height_mm, 100.0..=2400.0)
+                    .text("Max wind height (mm)"),
+            );
 
             ui.separator();
             ui.heading("Performance");

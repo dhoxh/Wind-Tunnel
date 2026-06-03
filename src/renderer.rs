@@ -7,7 +7,8 @@
 use bevy::prelude::*;
 
 use crate::fluid::FluidSim;
-use crate::grid::{Grid3D, CELL_SIZE};
+use crate::grid::{Grid3D, CELL_SIZE, MM_PER_CELL};
+use crate::Config;
 
 /// How far (in cells) each streamline integration step advances.
 const STEP_CELLS: f32 = 0.4;
@@ -41,6 +42,7 @@ pub fn draw_streamlines(
     sim: Res<FluidSim>,
     grid: Res<Grid3D>,
     settings: Res<VizSettings>,
+    config: Res<Config>,
 ) {
     if !settings.show_streamlines {
         return;
@@ -50,13 +52,17 @@ pub fn draw_streamlines(
     let max_speed = (sim.wind_speed / CELL_SIZE).max(0.001);
     let n = settings.density.max(2);
 
+    // Cap the seeded band height (in cells) so the wind reads as a sensible
+    // layer near the ground rather than filling the whole tall domain.
+    let top_y = (config.max_wind_height_mm / MM_PER_CELL).clamp(1.0, sim.h as f32 - 2.0);
+
     // Distribute seeds across the inlet cross-section (Y x Z), just inside the
     // walls so lines don't start clipped into the boundary.
     for iy in 0..n {
         for iz in 0..n {
             let fy = (iy as f32 + 0.5) / n as f32;
             let fz = (iz as f32 + 0.5) / n as f32;
-            let y = 1.0 + fy * (sim.h as f32 - 3.0);
+            let y = 1.0 + fy * (top_y - 1.0).max(0.0);
             let z = 1.0 + fz * (sim.d as f32 - 3.0);
 
             let mut pos = Vec3::new(0.6, y, z);

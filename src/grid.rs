@@ -5,11 +5,13 @@ pub const GRID_HEIGHT: usize = 24;
 pub const GRID_DEPTH: usize = 24;
 pub const CELL_SIZE: f32 = 0.6;
 
-/// Reference obstacle height (mm) that ride-height is expressed relative to.
-/// Ride height is interpreted as a fraction of the obstacle's own height using
-/// this as a nominal full height, so "40 mm" reads like a real car's ground
-/// clearance regardless of the imported model's arbitrary scale.
-pub const REF_HEIGHT_MM: f32 = 1200.0;
+/// Real-world size of one grid cell, in millimeters. This fixes the mapping
+/// between physical millimeters (ride height, wind-band height) and world units
+/// so all the mm-based controls share one consistent scale.
+pub const MM_PER_CELL: f32 = 100.0;
+
+/// World units per millimeter.
+pub const WORLD_PER_MM: f32 = CELL_SIZE / MM_PER_CELL;
 
 /// Static occupancy + scalar density grid for the wind tunnel domain.
 ///
