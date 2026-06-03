@@ -13,7 +13,7 @@ mod renderer;
 
 use fluid::FluidSim;
 use geometry::{ImportRequest, ModelPlacement, ObstacleViz, PendingLoad};
-use grid::{CELL_SIZE, MM_PER_CELL};
+use grid::REF_HEIGHT_MM;
 use renderer::VizSettings;
 
 #[derive(Component)]
@@ -35,9 +35,6 @@ pub struct Config {
     /// Model heading about the vertical axis, in degrees. The default faces the
     /// model into the oncoming wind.
     pub model_yaw_deg: f32,
-    /// Streamlines are only seeded up to this height above the ground, in mm,
-    /// so the wind reads as a sensible band instead of filling the whole domain.
-    pub max_wind_height_mm: f32,
     /// Frame-rate cap; `0` means uncapped. VSync is off so this governs pacing.
     pub fps_cap: f32,
 }
@@ -47,7 +44,6 @@ impl Default for Config {
         Self {
             ride_height_mm: 40.0,
             model_yaw_deg: -90.0,
-            max_wind_height_mm: 500.0,
             fps_cap: 144.0,
         }
     }
@@ -101,10 +97,7 @@ fn main() {
         .init_resource::<RestoreCubeRequest>()
         .init_resource::<ObstacleIsCube>()
         .init_resource::<PointerOverUi>()
-        .add_systems(
-            Startup,
-            (setup_3d, spawn_default_cube, spawn_fps_counter).chain(),
-        )
+        .add_systems(Startup, (setup_3d, spawn_fps_counter))
         .add_systems(
             Update,
             (
@@ -114,6 +107,7 @@ fn main() {
                 handle_controls,
                 step_fluid,
                 renderer::draw_streamlines,
+                renderer::draw_grid_box,
                 geometry::handle_import_request,
                 geometry::process_loading,
                 geometry::apply_placement,
@@ -164,83 +158,59 @@ fn setup_3d(
     ));
 }
 
-/// Number of cells the default cube spans in each axis.
-const CUBE_CELLS: usize = 6;
+/// World size of the built-in test cube.
+const CUBE_SIZE: f32 = 4.0;
 
-/// Seed the default cube into the grid and render its voxels, sitting on the
-/// ground at the configured ride height.
+/// Build the test cube as a single world-space box, fit the grid around it,
+/// voxelize it, and restart the flow.
 fn build_cube(
     commands: &mut Commands,
     grid: &mut grid::Grid3D,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    sim: &mut FluidSim,
     ride_mm: f32,
 ) {
-    let start_y = (ride_mm / MM_PER_CELL).round() as usize;
+    let gap = (ride_mm / REF_HEIGHT_MM) * CUBE_SIZE;
+    let bmin = Vec3::new(-CUBE_SIZE * 0.5, gap, -CUBE_SIZE * 0.5);
+    let bmax = Vec3::new(CUBE_SIZE * 0.5, gap + CUBE_SIZE, CUBE_SIZE * 0.5);
 
-    let cx = grid.width / 3;
-    let cz = grid.depth / 2;
-    let x0 = cx.saturating_sub(CUBE_CELLS / 2);
-    let z0 = cz.saturating_sub(CUBE_CELLS / 2);
-
-    for y in start_y..(start_y + CUBE_CELLS).min(grid.height) {
-        for z in z0..(z0 + CUBE_CELLS).min(grid.depth) {
-            for x in x0..(x0 + CUBE_CELLS).min(grid.width) {
-                let i = grid.index(x, y, z);
-                grid.solid[i] = true;
-            }
-        }
-    }
-
-    let voxel_mesh = meshes.add(Cuboid::new(CELL_SIZE, CELL_SIZE, CELL_SIZE));
-    let voxel_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.8, 0.2, 0.2),
-        perceptual_roughness: 0.95,
-        ..default()
-    });
-
+    grid.fit_to(bmin, bmax);
+    sim.resize(grid.width, grid.height, grid.depth);
     for z in 0..grid.depth {
         for y in 0..grid.height {
             for x in 0..grid.width {
-                if grid.solid[grid.index(x, y, z)] {
-                    commands.spawn((
-                        Voxel,
-                        ObstacleViz,
-                        Mesh3d(voxel_mesh.clone()),
-                        MeshMaterial3d(voxel_material.clone()),
-                        Transform::from_translation(grid.cell_to_world(x, y, z)),
-                    ));
+                let c = grid.cell_to_world(x, y, z);
+                if c.cmpge(bmin).all() && c.cmple(bmax).all() {
+                    let i = grid.index(x, y, z);
+                    grid.solid[i] = true;
                 }
             }
         }
     }
+
+    let center = (bmin + bmax) * 0.5;
+    commands.spawn((
+        Voxel,
+        ObstacleViz,
+        Mesh3d(meshes.add(Cuboid::new(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.8, 0.2, 0.2),
+            perceptual_roughness: 0.95,
+            ..default()
+        })),
+        Transform::from_translation(center),
+    ));
 }
 
-fn spawn_default_cube(
-    mut commands: Commands,
-    mut grid: ResMut<grid::Grid3D>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    config: Res<Config>,
-    mut is_cube: ResMut<ObstacleIsCube>,
-) {
-    build_cube(
-        &mut commands,
-        &mut grid,
-        &mut meshes,
-        &mut materials,
-        config.ride_height_mm,
-    );
-    is_cube.0 = true;
-}
-
-/// Rebuild the cube on explicit request, or when ride height changes while the
-/// cube (not a model) is the active obstacle.
+/// Build/rebuild the test cube on explicit request, or re-seat it when ride
+/// height changes while the cube (not a model) is the active obstacle.
 fn manage_cube(
     mut commands: Commands,
     mut grid: ResMut<grid::Grid3D>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut sim: ResMut<FluidSim>,
     config: Res<Config>,
     mut restore: ResMut<RestoreCubeRequest>,
     mut is_cube: ResMut<ObstacleIsCube>,
@@ -270,20 +240,24 @@ fn manage_cube(
     for e in &obstacles {
         commands.entity(e).despawn();
     }
-    grid.clear_solids();
     build_cube(
         &mut commands,
         &mut grid,
         &mut meshes,
         &mut materials,
+        &mut sim,
         config.ride_height_mm,
     );
     is_cube.0 = true;
     *last_ride = config.ride_height_mm;
 }
 
-/// Advance the Navier–Stokes solver each frame.
+/// Advance the Navier–Stokes solver each frame — but only when there's
+/// something in the tunnel, so an empty domain costs nothing.
 fn step_fluid(mut sim: ResMut<FluidSim>, grid: Res<grid::Grid3D>, time: Res<Time>) {
+    if !grid.has_obstacle() {
+        return;
+    }
     let dt = time.delta_secs();
     sim.step(&grid, dt);
 }
@@ -363,7 +337,7 @@ fn settings_ui(
                 if ui.button("Import GLB / glTF…").clicked() {
                     import.0 = true;
                 }
-                if ui.button("Restore cube").clicked() {
+                if ui.button("Add / reset cube").clicked() {
                     restore.0 = true;
                 }
             });
@@ -374,11 +348,8 @@ fn settings_ui(
             ui.checkbox(&mut viz.color_by_speed, "Color by speed (red = stagnation)");
             ui.checkbox(&mut viz.show_obstacle, "Show obstacle");
             ui.checkbox(&mut viz.spin_wheels, "Spin wheels");
+            ui.checkbox(&mut viz.show_grid, "Show grid box");
             ui.add(egui::Slider::new(&mut viz.density, 4..=36).text("Streamline density"));
-            ui.add(
-                egui::Slider::new(&mut config.max_wind_height_mm, 100.0..=2400.0)
-                    .text("Max wind height (mm)"),
-            );
 
             ui.separator();
             ui.heading("Performance");

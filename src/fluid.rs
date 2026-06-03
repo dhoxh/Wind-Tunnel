@@ -82,6 +82,29 @@ impl FluidSim {
         z * self.w * self.h + y * self.w + x
     }
 
+    /// Resize all buffers to new dimensions (when the grid is re-fitted around a
+    /// different object). Clears the field to rest. No-op other than a reset if
+    /// the dimensions are unchanged.
+    pub fn resize(&mut self, w: usize, h: usize, d: usize) {
+        if w == self.w && h == self.h && d == self.d {
+            self.reset();
+            return;
+        }
+        let n = w * h * d;
+        self.w = w;
+        self.h = h;
+        self.d = d;
+        self.u = vec![0.0; n];
+        self.v = vec![0.0; n];
+        self.ws = vec![0.0; n];
+        self.u0 = vec![0.0; n];
+        self.v0 = vec![0.0; n];
+        self.w0 = vec![0.0; n];
+        self.p = vec![0.0; n];
+        self.p1 = vec![0.0; n];
+        self.div = vec![0.0; n];
+    }
+
     /// Reset the entire velocity field to rest.
     pub fn reset(&mut self) {
         for buf in [
@@ -200,7 +223,7 @@ impl FluidSim {
 
     /// Drive the upwind face at the chosen wind speed, in the +X direction.
     fn apply_inflow(&mut self) {
-        let speed_cells = self.wind_speed / crate::grid::CELL_SIZE;
+        let speed_cells = self.wind_speed * crate::grid::INFLOW_GAIN;
         let xmax = 2.min(self.w);
         for z in 0..self.d {
             for y in 0..self.h {
@@ -267,7 +290,7 @@ impl FluidSim {
             return;
         }
         let idx = |x: usize, y: usize, z: usize| z * w * h + y * w + x;
-        let amp = self.turbulence * (self.wind_speed / crate::grid::CELL_SIZE) * 0.06;
+        let amp = self.turbulence * (self.wind_speed * crate::grid::INFLOW_GAIN) * 0.06;
         let mut rng = self.rng;
         let mut noise = || {
             rng ^= rng << 13;

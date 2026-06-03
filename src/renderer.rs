@@ -8,8 +8,7 @@ use bevy::prelude::*;
 use bevy::tasks::ComputeTaskPool;
 
 use crate::fluid::FluidSim;
-use crate::grid::{Grid3D, CELL_SIZE, MM_PER_CELL};
-use crate::Config;
+use crate::grid::{Grid3D, INFLOW_GAIN};
 
 /// How far (in cells) each streamline integration step advances. Smaller =
 /// smoother, more detailed lines that resolve tight curls and vortices.
@@ -25,6 +24,8 @@ pub struct VizSettings {
     pub color_by_speed: bool,
     /// Spin imported wheels at a rate proportional to wind speed.
     pub spin_wheels: bool,
+    /// Draw the adaptive simulation grid's bounding box.
+    pub show_grid: bool,
     /// Seed lines per axis on the inlet face (density x density lines).
     pub density: u32,
 }
@@ -36,6 +37,7 @@ impl Default for VizSettings {
             show_obstacle: true,
             color_by_speed: true,
             spin_wheels: true,
+            show_grid: true,
             density: 20,
         }
     }
@@ -54,34 +56,27 @@ pub fn draw_streamlines(
     sim: Res<FluidSim>,
     grid: Res<Grid3D>,
     settings: Res<VizSettings>,
-    config: Res<Config>,
 ) {
     if !settings.show_streamlines {
         return;
     }
 
-    let max_speed = (sim.wind_speed / CELL_SIZE).max(0.001);
+    let max_speed = (sim.wind_speed * INFLOW_GAIN).max(0.001);
     let n = settings.density.max(2);
     let color_by_speed = settings.color_by_speed;
     let origin = grid.world_origin();
 
-    // Seed region: hug the obstacle's frontal area when one exists, else fall
-    // back to a band up to the configured max wind height.
-    let (seed_x, y_lo, y_hi, z_lo, z_hi) = match solid_bbox(&grid) {
-        Some((mn, mx)) => {
-            let seed_x = (mn.x - 6.0).max(1.0);
-            // Down to the floor (underbody) and up over the wing.
-            let y_lo = 0.4_f32;
-            let y_hi = (mx.y + 3.0).min(sim.h as f32 - 2.0);
-            let z_lo = (mn.z - 1.5).max(1.0);
-            let z_hi = (mx.z + 1.5).min(sim.d as f32 - 2.0);
-            (seed_x, y_lo, y_hi, z_lo, z_hi)
-        }
-        None => {
-            let top = (config.max_wind_height_mm / MM_PER_CELL).clamp(1.0, sim.h as f32 - 2.0);
-            (0.6, 0.5, top, 1.0, sim.d as f32 - 2.0)
-        }
+    // Seed a tight rake hugging the obstacle's frontal area; nothing to show
+    // when the tunnel is empty.
+    let Some((mn, mx)) = solid_bbox(&grid) else {
+        return;
     };
+    let seed_x = (mn.x - 6.0).max(1.0);
+    // Down to the floor (underbody) and up over the wing.
+    let y_lo = 0.4_f32;
+    let y_hi = (mx.y + 3.0).min(sim.h as f32 - 2.0);
+    let z_lo = (mn.z - 1.5).max(1.0);
+    let z_hi = (mx.z + 1.5).min(sim.d as f32 - 2.0);
 
     let sim = &*sim;
     let grid = &*grid;
@@ -147,6 +142,7 @@ fn trace_streamline(
     max_speed: f32,
     color_by_speed: bool,
 ) -> Vec<(Vec3, Color)> {
+    let cell = grid.cell;
     let mut pos = Vec3::new(seed_x, y, z);
     let mut pts: Vec<(Vec3, Color)> = Vec::with_capacity(MAX_STEPS);
 
@@ -157,7 +153,7 @@ fn trace_streamline(
             break;
         }
 
-        let world = origin + pos * CELL_SIZE;
+        let world = origin + pos * cell;
         if grid.is_solid_world(world) {
             break;
         }
@@ -179,12 +175,42 @@ fn trace_streamline(
             || pos.z <= 0.5
             || pos.z >= sim.d as f32 - 1.0
         {
-            pts.push((origin + pos * CELL_SIZE, Color::srgb(0.6, 0.8, 1.0)));
+            pts.push((origin + pos * cell, Color::srgb(0.6, 0.8, 1.0)));
             break;
         }
     }
 
     pts
+}
+
+/// Draw the adaptive simulation domain as a wireframe box, so it's clear the
+/// flow is being computed in a grid fitted around the object.
+pub fn draw_grid_box(mut gizmos: Gizmos, grid: Res<Grid3D>, settings: Res<VizSettings>) {
+    if !settings.show_grid {
+        return;
+    }
+    let min = grid.world_origin() - Vec3::splat(0.5 * grid.cell);
+    let max = min + grid.world_size();
+    let color = Color::srgb(0.35, 0.40, 0.45);
+
+    let corners = [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(max.x, max.y, max.z),
+        Vec3::new(min.x, max.y, max.z),
+    ];
+    let edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0), // bottom
+        (4, 5), (5, 6), (6, 7), (7, 4), // top
+        (0, 4), (1, 5), (2, 6), (3, 7), // verticals
+    ];
+    for (a, b) in edges {
+        gizmos.line(corners[a], corners[b], color);
+    }
 }
 
 /// Blue (slow) -> cyan -> green -> yellow -> red (fast).

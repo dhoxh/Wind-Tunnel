@@ -18,8 +18,17 @@ use bevy::scene::SceneRoot;
 
 use bevy::asset::LoadState;
 
-use crate::grid::{Grid3D, CELL_SIZE, WORLD_PER_MM};
+use crate::fluid::FluidSim;
+use crate::grid::{Grid3D, REF_HEIGHT_MM};
 use crate::Config;
+
+/// Longest horizontal extent (world units) the imported model is scaled to, so
+/// every car ends up a consistent, camera-friendly size; the grid then wraps
+/// the placed model.
+const MODEL_TARGET_LEN: f32 = 12.0;
+/// Cells of guaranteed clearance under an imported model so the wind has a
+/// channel to flow through the underbody.
+const UNDERBODY_CLEAR: usize = 1;
 
 /// Marker for anything that counts as "the obstacle" for the show/hide toggle:
 /// the default cube voxels and imported model roots both carry it.
@@ -52,6 +61,8 @@ pub struct ModelPlacement {
     applied_yaw: f32,
     /// Frames to wait before voxelizing (lets the new transform propagate).
     voxelize_in: Option<u8>,
+    /// First voxelization after import resets the flow field.
+    initial: bool,
 }
 
 /// Opens the file dialog when requested and kicks off an async scene load.
@@ -91,6 +102,7 @@ pub fn handle_import_request(
         commands.entity(e).despawn();
     }
     grid.clear_solids();
+    grid.reset_placement();
     commands.remove_resource::<ModelPlacement>();
 
     info!("Loading model: {asset_path}");
@@ -113,7 +125,6 @@ pub fn process_loading(
     mut commands: Commands,
     pending: Option<Res<PendingLoad>>,
     asset_server: Res<AssetServer>,
-    grid: Res<Grid3D>,
     config: Res<Config>,
     meshes: Res<Assets<Mesh>>,
     children_q: Query<&Children>,
@@ -141,16 +152,12 @@ pub fn process_loading(
         return;
     };
 
-    // Fit using the bounds *after* the default heading rotation, since rotating
-    // a car to face the wind swaps its long axis into the flow direction.
+    // Scale so the longest horizontal extent (after the heading rotation)
+    // matches a consistent target size. The grid is fitted to the placed model
+    // afterwards, so the model size is decoupled from the grid.
     let rot = Quat::from_rotation_y(config.model_yaw_deg.to_radians());
     let rsize = rotated_extents(min, max, rot);
-    let target_x = grid.width as f32 * CELL_SIZE * 0.50;
-    let target_y = grid.height as f32 * CELL_SIZE * 0.70;
-    let target_z = grid.depth as f32 * CELL_SIZE * 0.60;
-    let scale = (target_x / rsize.x.max(1e-4))
-        .min(target_y / rsize.y.max(1e-4))
-        .min(target_z / rsize.z.max(1e-4));
+    let scale = MODEL_TARGET_LEN / rsize.x.max(rsize.z).max(1e-4);
 
     commands.insert_resource(ModelPlacement {
         root: pending.root,
@@ -160,6 +167,7 @@ pub fn process_loading(
         applied_ride: f32::MIN, // force first apply
         applied_yaw: f32::MIN,
         voxelize_in: None,
+        initial: true,
     });
     commands.remove_resource::<PendingLoad>();
 }
@@ -170,6 +178,7 @@ pub fn apply_placement(
     placement: Option<ResMut<ModelPlacement>>,
     config: Res<Config>,
     mut grid: ResMut<Grid3D>,
+    mut sim: ResMut<FluidSim>,
     meshes: Res<Assets<Mesh>>,
     children_q: Query<&Children>,
     mesh_q: Query<(&Mesh3d, &GlobalTransform)>,
@@ -179,24 +188,24 @@ pub fn apply_placement(
         return;
     };
 
-    // Re-seat when the relevant settings changed (or on first apply).
+    // Re-seat when the relevant settings changed (or on first apply). The model
+    // is anchored at world origin (X=Z=0); the grid is fitted around it below.
     if config.ride_height_mm != placement.applied_ride
         || config.model_yaw_deg != placement.applied_yaw
     {
         let s = placement.scale;
         let rot = Quat::from_rotation_y(config.model_yaw_deg.to_radians());
 
-        let gap = config.ride_height_mm * WORLD_PER_MM;
+        let height_world = (placement.bbox_max.y - placement.bbox_min.y) * s;
+        let gap = (config.ride_height_mm / REF_HEIGHT_MM) * height_world;
 
         let centroid = (placement.bbox_min + placement.bbox_max) * 0.5;
         let rc = rot * centroid;
-        let domain_center =
-            grid.cell_to_world(grid.width / 2, grid.height / 2, grid.depth / 2);
 
         // world = T + rot*(s*local); rotation about Y leaves Y unchanged.
         let ty = gap - s * placement.bbox_min.y; // bottom sits `gap` above ground
-        let tx = domain_center.x - s * rc.x;
-        let tz = domain_center.z - s * rc.z;
+        let tx = -s * rc.x; // center on X = 0
+        let tz = -s * rc.z; // center on Z = 0
 
         if let Ok(mut t) = transforms.get_mut(placement.root) {
             *t = Transform::from_translation(Vec3::new(tx, ty, tz))
@@ -210,15 +219,26 @@ pub fn apply_placement(
         return;
     }
 
-    // Re-voxelize once the transform has settled.
+    // Voxelize once the transform has settled. On the first pass after import
+    // the grid is fitted to the model (and the solver resized); later ride/
+    // heading tweaks just re-voxelize into the existing fitted grid so the flow
+    // isn't reset on every slider drag.
     match placement.voxelize_in {
         Some(n) if n > 0 => placement.voxelize_in = Some(n - 1),
         Some(_) => {
             let entries = collect_meshes(placement.root, &children_q, &mesh_q, &meshes);
-            grid.clear_solids();
-            voxelize(&entries, &mut grid);
-            let n: usize = grid.solid.iter().filter(|s| **s).count();
-            info!("Model voxelized into {n} solid cells.");
+            if let Some((wmin, wmax)) = world_bbox(&entries) {
+                if placement.initial {
+                    grid.fit_to(wmin, wmax);
+                    sim.resize(grid.width, grid.height, grid.depth);
+                    placement.initial = false;
+                } else {
+                    grid.clear_solids();
+                }
+                voxelize(&entries, &mut grid, UNDERBODY_CLEAR);
+                let n: usize = grid.solid.iter().filter(|s| **s).count();
+                info!("Model voxelized into {n} solid cells.");
+            }
             placement.voxelize_in = None;
         }
         None => {}
@@ -283,8 +303,10 @@ fn rotated_extents(min: Vec3, max: Vec3, rot: Quat) -> Vec3 {
     hi - lo
 }
 
-/// Surface-voxelize triangles into the solid mask.
-fn voxelize(entries: &[(&Mesh, GlobalTransform)], grid: &mut Grid3D) {
+/// Surface-voxelize triangles into the solid mask, keeping the bottom
+/// `min_clear` cell rows open so the wind has an underbody channel.
+fn voxelize(entries: &[(&Mesh, GlobalTransform)], grid: &mut Grid3D, min_clear: usize) {
+    let cell = grid.cell;
     let mark = |w: Vec3, grid: &mut Grid3D| {
         let g = grid.world_to_grid(w);
         let (x, y, z) = (g.x.round(), g.y.round(), g.z.round());
@@ -292,6 +314,9 @@ fn voxelize(entries: &[(&Mesh, GlobalTransform)], grid: &mut Grid3D) {
             return;
         }
         let (x, y, z) = (x as usize, y as usize, z as usize);
+        if y < min_clear {
+            return; // keep an underbody channel
+        }
         if x < grid.width && y < grid.height && z < grid.depth {
             let i = grid.index(x, y, z);
             grid.solid[i] = true;
@@ -314,7 +339,7 @@ fn voxelize(entries: &[(&Mesh, GlobalTransform)], grid: &mut Grid3D) {
             let c = gt.transform_point(Vec3::from(positions[tri[2]]));
 
             let edge = (b - a).length().max((c - a).length()).max((c - b).length());
-            let steps = ((edge / CELL_SIZE) * 2.0).ceil().max(1.0) as usize;
+            let steps = ((edge / cell) * 2.0).ceil().max(1.0) as usize;
             for i in 0..=steps {
                 for j in 0..=(steps - i) {
                     let u = i as f32 / steps as f32;
