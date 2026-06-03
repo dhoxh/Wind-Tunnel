@@ -374,7 +374,7 @@ fn settings_ui(
             ui.checkbox(&mut viz.color_by_speed, "Color by speed (red = stagnation)");
             ui.checkbox(&mut viz.show_obstacle, "Show obstacle");
             ui.checkbox(&mut viz.spin_wheels, "Spin wheels");
-            ui.add(egui::Slider::new(&mut viz.density, 4..=24).text("Streamline density"));
+            ui.add(egui::Slider::new(&mut viz.density, 4..=36).text("Streamline density"));
             ui.add(
                 egui::Slider::new(&mut config.max_wind_height_mm, 100.0..=2400.0)
                     .text("Max wind height (mm)"),

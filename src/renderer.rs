@@ -11,10 +11,11 @@ use crate::fluid::FluidSim;
 use crate::grid::{Grid3D, CELL_SIZE, MM_PER_CELL};
 use crate::Config;
 
-/// How far (in cells) each streamline integration step advances.
-const STEP_CELLS: f32 = 0.4;
+/// How far (in cells) each streamline integration step advances. Smaller =
+/// smoother, more detailed lines that resolve tight curls and vortices.
+const STEP_CELLS: f32 = 0.3;
 /// Maximum samples per streamline before we stop tracing.
-const MAX_STEPS: usize = 220;
+const MAX_STEPS: usize = 340;
 
 /// Display options, driven from the settings menu.
 #[derive(Resource)]
@@ -35,14 +36,19 @@ impl Default for VizSettings {
             show_obstacle: true,
             color_by_speed: true,
             spin_wheels: true,
-            density: 12,
+            density: 20,
         }
     }
 }
 
 /// Trace and draw the streamlines for the current velocity field each frame.
-/// Tracing is parallelized across the compute pool (one task per seed row);
-/// only the cheap gizmo drawing happens on the main thread.
+///
+/// Seeds form a tight, dense rake sized to the obstacle's frontal area (a bit
+/// upstream of it) so the lines hug and detail the whole car rather than
+/// spreading across the empty tunnel; longer traces let the wake vortices and
+/// downwash off the wing develop. Tracing is parallelized across the compute
+/// pool (one task per seed row); only the cheap gizmo drawing is on the main
+/// thread.
 pub fn draw_streamlines(
     mut gizmos: Gizmos,
     sim: Res<FluidSim>,
@@ -54,14 +60,28 @@ pub fn draw_streamlines(
         return;
     }
 
-    let origin = grid.world_origin();
     let max_speed = (sim.wind_speed / CELL_SIZE).max(0.001);
     let n = settings.density.max(2);
     let color_by_speed = settings.color_by_speed;
+    let origin = grid.world_origin();
 
-    // Cap the seeded band height (in cells) so the wind reads as a sensible
-    // layer near the ground rather than filling the whole tall domain.
-    let top_y = (config.max_wind_height_mm / MM_PER_CELL).clamp(1.0, sim.h as f32 - 2.0);
+    // Seed region: hug the obstacle's frontal area when one exists, else fall
+    // back to a band up to the configured max wind height.
+    let (seed_x, y_lo, y_hi, z_lo, z_hi) = match solid_bbox(&grid) {
+        Some((mn, mx)) => {
+            let seed_x = (mn.x - 6.0).max(1.0);
+            // Down to the floor (underbody) and a little over the roof.
+            let y_lo = 0.4_f32;
+            let y_hi = (mx.y + 2.0).min(sim.h as f32 - 2.0);
+            let z_lo = (mn.z - 1.5).max(1.0);
+            let z_hi = (mx.z + 1.5).min(sim.d as f32 - 2.0);
+            (seed_x, y_lo, y_hi, z_lo, z_hi)
+        }
+        None => {
+            let top = (config.max_wind_height_mm / MM_PER_CELL).clamp(1.0, sim.h as f32 - 2.0);
+            (0.6, 0.5, top, 1.0, sim.d as f32 - 2.0)
+        }
+    };
 
     let sim = &*sim;
     let grid = &*grid;
@@ -72,13 +92,13 @@ pub fn draw_streamlines(
         for iy in 0..n {
             scope.spawn(async move {
                 let fy = (iy as f32 + 0.5) / n as f32;
-                // Seed down near the floor so some lines thread the underbody gap.
-                let y = 0.5 + fy * (top_y - 0.5).max(0.0);
+                let y = y_lo + fy * (y_hi - y_lo).max(0.0);
                 let mut lines = Vec::with_capacity(n as usize);
                 for iz in 0..n {
                     let fz = (iz as f32 + 0.5) / n as f32;
-                    let z = 1.0 + fz * (sim.d as f32 - 3.0);
-                    let line = trace_streamline(sim, grid, origin, y, z, max_speed, color_by_speed);
+                    let z = z_lo + fz * (z_hi - z_lo).max(0.0);
+                    let line =
+                        trace_streamline(sim, grid, origin, seed_x, y, z, max_speed, color_by_speed);
                     if line.len() >= 2 {
                         lines.push(line);
                     }
@@ -95,17 +115,39 @@ pub fn draw_streamlines(
     }
 }
 
+/// Bounding box (in continuous cell coordinates) of all solid cells, or `None`
+/// if there is no obstacle.
+fn solid_bbox(grid: &Grid3D) -> Option<(Vec3, Vec3)> {
+    let mut mn = IVec3::splat(i32::MAX);
+    let mut mx = IVec3::splat(i32::MIN);
+    let mut any = false;
+    for z in 0..grid.depth {
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                if grid.solid[grid.index(x, y, z)] {
+                    any = true;
+                    let p = IVec3::new(x as i32, y as i32, z as i32);
+                    mn = mn.min(p);
+                    mx = mx.max(p);
+                }
+            }
+        }
+    }
+    any.then(|| (mn.as_vec3(), mx.as_vec3()))
+}
+
 /// Integrate a single streamline from one inlet seed by fixed arc-length steps.
 fn trace_streamline(
     sim: &FluidSim,
     grid: &Grid3D,
     origin: Vec3,
+    seed_x: f32,
     y: f32,
     z: f32,
     max_speed: f32,
     color_by_speed: bool,
 ) -> Vec<(Vec3, Color)> {
-    let mut pos = Vec3::new(0.6, y, z);
+    let mut pos = Vec3::new(seed_x, y, z);
     let mut pts: Vec<(Vec3, Color)> = Vec::with_capacity(MAX_STEPS);
 
     for _ in 0..MAX_STEPS {
