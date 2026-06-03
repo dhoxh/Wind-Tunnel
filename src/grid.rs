@@ -1,14 +1,15 @@
 use bevy::prelude::*;
 
-pub const GRID_WIDTH: usize = 40;
-pub const GRID_HEIGHT: usize = 24;
-pub const GRID_DEPTH: usize = 24;
+pub const GRID_WIDTH: usize = 48;
+pub const GRID_HEIGHT: usize = 28;
+pub const GRID_DEPTH: usize = 28;
 pub const CELL_SIZE: f32 = 0.6;
 
 /// Real-world size of one grid cell, in millimeters. This fixes the mapping
 /// between physical millimeters (ride height, wind-band height) and world units
-/// so all the mm-based controls share one consistent scale.
-pub const MM_PER_CELL: f32 = 100.0;
+/// so all the mm-based controls share one consistent scale. At 50 mm/cell a
+/// typical ride height leaves a ~1-cell channel under the car for underbody flow.
+pub const MM_PER_CELL: f32 = 50.0;
 
 /// World units per millimeter.
 pub const WORLD_PER_MM: f32 = CELL_SIZE / MM_PER_CELL;

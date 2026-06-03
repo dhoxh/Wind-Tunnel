@@ -21,6 +21,8 @@ pub struct VizSettings {
     pub show_streamlines: bool,
     pub show_obstacle: bool,
     pub color_by_speed: bool,
+    /// Spin imported wheels at a rate proportional to wind speed.
+    pub spin_wheels: bool,
     /// Seed lines per axis on the inlet face (density x density lines).
     pub density: u32,
 }
@@ -31,6 +33,7 @@ impl Default for VizSettings {
             show_streamlines: true,
             show_obstacle: true,
             color_by_speed: true,
+            spin_wheels: true,
             density: 12,
         }
     }
@@ -62,7 +65,8 @@ pub fn draw_streamlines(
         for iz in 0..n {
             let fy = (iy as f32 + 0.5) / n as f32;
             let fz = (iz as f32 + 0.5) / n as f32;
-            let y = 1.0 + fy * (top_y - 1.0).max(0.0);
+            // Seed down near the floor so some lines thread the underbody gap.
+            let y = 0.5 + fy * (top_y - 0.5).max(0.0);
             let z = 1.0 + fz * (sim.d as f32 - 3.0);
 
             let mut pos = Vec3::new(0.6, y, z);
@@ -81,8 +85,10 @@ pub fn draw_streamlines(
                 }
 
                 let t = (speed / max_speed).clamp(0.0, 1.0);
+                // Reversed: slow/stagnation (air hitting the car) = red,
+                // fast free-stream = blue.
                 let color = if settings.color_by_speed {
-                    speed_color(t)
+                    speed_color(1.0 - t)
                 } else {
                     Color::srgb(0.6, 0.8, 1.0)
                 };
@@ -92,7 +98,7 @@ pub fn draw_streamlines(
                 pos += (vel / speed) * STEP_CELLS;
 
                 if pos.x >= sim.w as f32 - 1.0
-                    || pos.y <= 0.5
+                    || pos.y <= 0.2
                     || pos.y >= sim.h as f32 - 1.0
                     || pos.z <= 0.5
                     || pos.z >= sim.d as f32 - 1.0
