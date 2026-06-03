@@ -5,6 +5,7 @@
 //! with Bevy gizmos and colored by local speed (blue = slow -> red = fast).
 
 use bevy::prelude::*;
+use bevy::tasks::ComputeTaskPool;
 
 use crate::fluid::FluidSim;
 use crate::grid::{Grid3D, CELL_SIZE, MM_PER_CELL};
@@ -40,6 +41,8 @@ impl Default for VizSettings {
 }
 
 /// Trace and draw the streamlines for the current velocity field each frame.
+/// Tracing is parallelized across the compute pool (one task per seed row);
+/// only the cheap gizmo drawing happens on the main thread.
 pub fn draw_streamlines(
     mut gizmos: Gizmos,
     sim: Res<FluidSim>,
@@ -54,66 +57,92 @@ pub fn draw_streamlines(
     let origin = grid.world_origin();
     let max_speed = (sim.wind_speed / CELL_SIZE).max(0.001);
     let n = settings.density.max(2);
+    let color_by_speed = settings.color_by_speed;
 
     // Cap the seeded band height (in cells) so the wind reads as a sensible
     // layer near the ground rather than filling the whole tall domain.
     let top_y = (config.max_wind_height_mm / MM_PER_CELL).clamp(1.0, sim.h as f32 - 2.0);
 
-    // Distribute seeds across the inlet cross-section (Y x Z), just inside the
-    // walls so lines don't start clipped into the boundary.
-    for iy in 0..n {
-        for iz in 0..n {
-            let fy = (iy as f32 + 0.5) / n as f32;
-            let fz = (iz as f32 + 0.5) / n as f32;
-            // Seed down near the floor so some lines thread the underbody gap.
-            let y = 0.5 + fy * (top_y - 0.5).max(0.0);
-            let z = 1.0 + fz * (sim.d as f32 - 3.0);
+    let sim = &*sim;
+    let grid = &*grid;
+    let pool = ComputeTaskPool::get();
 
-            let mut pos = Vec3::new(0.6, y, z);
-            let mut pts: Vec<(Vec3, Color)> = Vec::with_capacity(MAX_STEPS);
-
-            for _ in 0..MAX_STEPS {
-                let vel = sim.sample_velocity(pos.x, pos.y, pos.z);
-                let speed = vel.length();
-                if speed < 1e-4 {
-                    break;
+    // Each task traces one row of seeds (across Z) and returns its polylines.
+    let rows: Vec<Vec<Vec<(Vec3, Color)>>> = pool.scope(|scope| {
+        for iy in 0..n {
+            scope.spawn(async move {
+                let fy = (iy as f32 + 0.5) / n as f32;
+                // Seed down near the floor so some lines thread the underbody gap.
+                let y = 0.5 + fy * (top_y - 0.5).max(0.0);
+                let mut lines = Vec::with_capacity(n as usize);
+                for iz in 0..n {
+                    let fz = (iz as f32 + 0.5) / n as f32;
+                    let z = 1.0 + fz * (sim.d as f32 - 3.0);
+                    let line = trace_streamline(sim, grid, origin, y, z, max_speed, color_by_speed);
+                    if line.len() >= 2 {
+                        lines.push(line);
+                    }
                 }
+                lines
+            });
+        }
+    });
 
-                let world = origin + pos * CELL_SIZE;
-                if grid.is_solid_world(world) {
-                    break;
-                }
-
-                let t = (speed / max_speed).clamp(0.0, 1.0);
-                // Reversed: slow/stagnation (air hitting the car) = red,
-                // fast free-stream = blue.
-                let color = if settings.color_by_speed {
-                    speed_color(1.0 - t)
-                } else {
-                    Color::srgb(0.6, 0.8, 1.0)
-                };
-                pts.push((world, color));
-
-                // Advance by a fixed arc length for evenly spaced, smooth lines.
-                pos += (vel / speed) * STEP_CELLS;
-
-                if pos.x >= sim.w as f32 - 1.0
-                    || pos.y <= 0.2
-                    || pos.y >= sim.h as f32 - 1.0
-                    || pos.z <= 0.5
-                    || pos.z >= sim.d as f32 - 1.0
-                {
-                    let world = origin + pos * CELL_SIZE;
-                    pts.push((world, Color::srgb(0.6, 0.8, 1.0)));
-                    break;
-                }
-            }
-
-            if pts.len() >= 2 {
-                gizmos.linestrip_gradient(pts);
-            }
+    for row in rows {
+        for line in row {
+            gizmos.linestrip_gradient(line);
         }
     }
+}
+
+/// Integrate a single streamline from one inlet seed by fixed arc-length steps.
+fn trace_streamline(
+    sim: &FluidSim,
+    grid: &Grid3D,
+    origin: Vec3,
+    y: f32,
+    z: f32,
+    max_speed: f32,
+    color_by_speed: bool,
+) -> Vec<(Vec3, Color)> {
+    let mut pos = Vec3::new(0.6, y, z);
+    let mut pts: Vec<(Vec3, Color)> = Vec::with_capacity(MAX_STEPS);
+
+    for _ in 0..MAX_STEPS {
+        let vel = sim.sample_velocity(pos.x, pos.y, pos.z);
+        let speed = vel.length();
+        if speed < 1e-4 {
+            break;
+        }
+
+        let world = origin + pos * CELL_SIZE;
+        if grid.is_solid_world(world) {
+            break;
+        }
+
+        let t = (speed / max_speed).clamp(0.0, 1.0);
+        // Reversed: slow/stagnation (air hitting the car) = red, fast = blue.
+        let color = if color_by_speed {
+            speed_color(1.0 - t)
+        } else {
+            Color::srgb(0.6, 0.8, 1.0)
+        };
+        pts.push((world, color));
+
+        pos += (vel / speed) * STEP_CELLS;
+
+        if pos.x >= sim.w as f32 - 1.0
+            || pos.y <= 0.2
+            || pos.y >= sim.h as f32 - 1.0
+            || pos.z <= 0.5
+            || pos.z >= sim.d as f32 - 1.0
+        {
+            pts.push((origin + pos * CELL_SIZE, Color::srgb(0.6, 0.8, 1.0)));
+            break;
+        }
+    }
+
+    pts
 }
 
 /// Blue (slow) -> cyan -> green -> yellow -> red (fast).
