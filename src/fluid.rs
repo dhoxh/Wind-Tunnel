@@ -41,6 +41,8 @@ pub struct FluidSim {
     p: Vec<f32>,
     p1: Vec<f32>,
     div: Vec<f32>,
+    /// State for the turbulence noise generator.
+    rng: u64,
 
     // User-tunable parameters.
     pub wind_speed: f32,
@@ -67,9 +69,10 @@ impl FluidSim {
             p: vec![0.0; n],
             p1: vec![0.0; n],
             div: vec![0.0; n],
+            rng: 0x9E3779B97F4A7C15,
             wind_speed: 20.0,
             viscosity: 0.0,
-            turbulence: 1.0,
+            turbulence: 2.0,
             running: true,
         }
     }
@@ -182,8 +185,10 @@ impl FluidSim {
         self.apply_inflow();
         self.enforce_obstacles(grid);
 
-        // --- Turbulence force (folded into the single projection below) -----
+        // --- Turbulence: shed eddies off the body, then confine them --------
+        // (both folded into the single projection below).
         if self.turbulence > 0.0 {
+            self.inject_shear_turbulence(grid);
             self.apply_turbulence(grid, dt);
             self.enforce_obstacles(grid);
         }
@@ -249,6 +254,51 @@ impl FluidSim {
                 }
             }
         }
+    }
+
+    /// Generate turbulence where the flow shears past the body: every fluid
+    /// cell touching a solid cell gets a small random velocity kick. The
+    /// projection turns these into divergence-free eddies that advect into the
+    /// wake and are sustained by vorticity confinement — this is what fills the
+    /// region behind/below the wing with swirling, unsteady flow.
+    fn inject_shear_turbulence(&mut self, grid: &Grid3D) {
+        let (w, h, d) = (self.w, self.h, self.d);
+        if w < 3 || h < 3 || d < 3 {
+            return;
+        }
+        let idx = |x: usize, y: usize, z: usize| z * w * h + y * w + x;
+        let amp = self.turbulence * (self.wind_speed / crate::grid::CELL_SIZE) * 0.06;
+        let mut rng = self.rng;
+        let mut noise = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+
+        for z in 1..d - 1 {
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    let i = idx(x, y, z);
+                    if grid.solid[i] {
+                        continue;
+                    }
+                    let touches_body = grid.solid[idx(x + 1, y, z)]
+                        || grid.solid[idx(x - 1, y, z)]
+                        || grid.solid[idx(x, y + 1, z)]
+                        || grid.solid[idx(x, y - 1, z)]
+                        || grid.solid[idx(x, y, z + 1)]
+                        || grid.solid[idx(x, y, z - 1)];
+                    if !touches_body {
+                        continue;
+                    }
+                    self.u[i] += noise() * amp;
+                    self.v[i] += noise() * amp;
+                    self.ws[i] += noise() * amp;
+                }
+            }
+        }
+        self.rng = rng;
     }
 
     /// Vorticity confinement: find each cell's local swirl (curl) and push
