@@ -69,7 +69,7 @@ impl FluidSim {
             div: vec![0.0; n],
             wind_speed: 20.0,
             viscosity: 0.0,
-            turbulence: 0.5,
+            turbulence: 1.0,
             running: true,
         }
     }
