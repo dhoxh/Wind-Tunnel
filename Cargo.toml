@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy = "0.18"
+bevy_egui = "0.39.1"
 # Portal backend avoids GTK system build-deps for the native file picker.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }
 

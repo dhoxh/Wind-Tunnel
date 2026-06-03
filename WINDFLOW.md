@@ -20,11 +20,18 @@ with live toggles for speed, viscosity, and what you're looking at.
 - **Model import from disk.** Press **O** to open a native file picker, choose a
   `.glb`/`.gltf` model, and RustFlow auto-fits it into the middle of the tunnel
   and voxelizes it into the solver so the wind reacts to its real shape.
-- **Particle visualization.** Thousands of tracer particles are seeded on the
-  upwind face and advected through the velocity field, revealing streamlines and
-  turbulence. They're colored by local speed (blue = slow → red = fast).
-- **Live controls.** Wind speed, viscosity, pause/resume, flow reset, and every
-  visualization layer can be toggled from the keyboard while the sim runs.
+- **Streamline visualization.** A regular lattice of seed points on the upwind
+  face is traced through the velocity field into smooth streamlines — the way a
+  real wind tunnel reveals flow with a smoke rake. Lines bend over and around
+  the body and trail into the wake, colored by local speed (blue = slow → red =
+  fast).
+- **On-the-ground placement.** The obstacle sits on the tunnel floor at an
+  adjustable **ride height** (default 40 mm, 20–150 mm), so an imported car
+  rests at realistic ground clearance and you can study ground effect.
+- **Settings menu.** An on-screen panel (egui) with sliders and toggles for wind
+  speed, viscosity, ride height, model heading, streamline density, FPS cap, and
+  every visualization layer — all live while the sim runs. VSync is off and the
+  frame rate is governed by the FPS-cap slider.
 
 ---
 
@@ -60,39 +67,47 @@ which is exactly what an interactive visualization needs.
 
 ### Model import & voxelization (`src/geometry.rs`)
 
-1. **Pick** — `rfd` opens a native dialog filtered to `.glb`/`.gltf`.
-2. **Stage & load** — the file is copied into `assets/imported/` and loaded as a
-   Bevy scene.
-3. **Auto-fit** — once the meshes load, the combined bounding box is scaled and
-   centered to sit nicely in the tunnel.
-4. **Voxelize** — every triangle is surface-sampled into `Grid3D::solid`, so the
-   solver sees the model's actual silhouette.
+1. **Pick** — `rfd` opens a native dialog filtered to `.glb`/`.gltf`. A single
+   `.glb` is copied as-is; a multi-file `.gltf` brings its whole folder (the
+   `.bin` buffers and textures) along.
+2. **Auto-fit** — the combined bounding box is scaled to the tunnel using the
+   model's *rotated* extents (so a car's long axis ends up along the flow).
+3. **Face the wind** — the model is rotated to point into the oncoming airflow;
+   the heading is adjustable with a slider if a model's forward axis differs.
+4. **Seat on the ground** — the model is translated so its underside sits at the
+   chosen ride height above the floor.
+5. **Voxelize** — every triangle is surface-sampled into `Grid3D::solid`, so the
+   solver sees the model's actual silhouette. Changing ride height or heading
+   re-seats and re-voxelizes the model live.
 
 ### Visualization (`src/renderer.rs`)
 
-Tracer particles live in grid coordinates and integrate through the sampled
-(trilinear) velocity field each frame. When a particle leaves the domain, dies,
-or enters an obstacle, it respawns on the inlet. A preallocated blue→red
-emissive palette colors each particle by its normalized speed.
+Each frame, a `density × density` lattice of seed points on the inlet is traced
+through the (trilinearly sampled) velocity field by fixed-arc-length steps,
+producing evenly spaced, smooth streamlines drawn with Bevy gizmos. A trace
+stops when it reaches the outlet, a wall, or the obstacle, and each segment is
+colored by local speed.
 
 ---
 
 ## Controls
 
+Most settings live in the **Wind Tunnel** panel (top-left): sliders for wind
+speed, viscosity, ride height, heading, streamline density, and FPS cap, plus
+toggles and import/restore buttons. Keyboard shortcuts mirror the common ones:
+
 | Key | Action |
 | --- | --- |
 | `O` | Import a 3D model (GLB / glTF) via file picker |
-| `X` | Clear the import and restore the default block |
-| `[` / `]` | Decrease / increase wind speed |
-| `,` / `.` | Decrease / increase viscosity |
+| `X` | Clear the import and restore the default cube |
 | `Enter` | Pause / resume the simulation |
 | `R` | Reset the flow field to rest |
-| `P` | Toggle wind particles |
+| `P` | Toggle streamlines |
 | `B` | Toggle obstacle visibility |
 | `C` | Toggle color-by-speed |
 | `W A S D` | Move camera |
 | `Space` / `Shift` | Move camera up / down |
-| Hold Left-Mouse | Look around |
+| Hold Left-Mouse | Look around (ignored while over the settings panel) |
 
 ---
 
