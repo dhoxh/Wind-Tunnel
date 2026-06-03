@@ -342,7 +342,7 @@ fn settings_ui(
             ui.add(egui::Slider::new(&mut sim.wind_speed, 0.0..=103.0).text("Speed (m/s)"));
             ui.label(format!("≈ {:.0} mph", sim.wind_speed * 2.2369));
             ui.add(egui::Slider::new(&mut sim.viscosity, 0.0..=5.0).text("Viscosity"));
-            ui.add(egui::Slider::new(&mut sim.turbulence, 0.0..=3.0).text("Turbulence"));
+            ui.add(egui::Slider::new(&mut sim.turbulence, 0.0..=5.0).text("Turbulence"));
             ui.horizontal(|ui| {
                 ui.checkbox(&mut sim.running, "Run");
                 if ui.button("Reset flow").clicked() {

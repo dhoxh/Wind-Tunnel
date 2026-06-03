@@ -15,7 +15,7 @@ use crate::Config;
 /// smoother, more detailed lines that resolve tight curls and vortices.
 const STEP_CELLS: f32 = 0.3;
 /// Maximum samples per streamline before we stop tracing.
-const MAX_STEPS: usize = 340;
+const MAX_STEPS: usize = 380;
 
 /// Display options, driven from the settings menu.
 #[derive(Resource)]
@@ -70,9 +70,9 @@ pub fn draw_streamlines(
     let (seed_x, y_lo, y_hi, z_lo, z_hi) = match solid_bbox(&grid) {
         Some((mn, mx)) => {
             let seed_x = (mn.x - 6.0).max(1.0);
-            // Down to the floor (underbody) and a little over the roof.
+            // Down to the floor (underbody) and up over the wing.
             let y_lo = 0.4_f32;
-            let y_hi = (mx.y + 2.0).min(sim.h as f32 - 2.0);
+            let y_hi = (mx.y + 3.0).min(sim.h as f32 - 2.0);
             let z_lo = (mn.z - 1.5).max(1.0);
             let z_hi = (mx.z + 1.5).min(sim.d as f32 - 2.0);
             (seed_x, y_lo, y_hi, z_lo, z_hi)
