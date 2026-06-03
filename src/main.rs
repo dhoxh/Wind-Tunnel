@@ -119,6 +119,7 @@ fn main() {
                 geometry::apply_placement,
                 manage_cube,
                 toggle_obstacle_visibility,
+                spin_wheels,
             ),
         )
         .add_systems(EguiPrimaryContextPass, settings_ui)
@@ -337,8 +338,11 @@ fn settings_ui(
         .resizable(false)
         .show(ctx, |ui| {
             ui.heading("Airflow");
-            ui.add(egui::Slider::new(&mut sim.wind_speed, 0.0..=30.0).text("Speed (m/s)"));
+            // 0–230 mph expressed in m/s (230 mph ≈ 102.8 m/s).
+            ui.add(egui::Slider::new(&mut sim.wind_speed, 0.0..=103.0).text("Speed (m/s)"));
+            ui.label(format!("≈ {:.0} mph", sim.wind_speed * 2.2369));
             ui.add(egui::Slider::new(&mut sim.viscosity, 0.0..=5.0).text("Viscosity"));
+            ui.add(egui::Slider::new(&mut sim.turbulence, 0.0..=3.0).text("Turbulence"));
             ui.horizontal(|ui| {
                 ui.checkbox(&mut sim.running, "Run");
                 if ui.button("Reset flow").clicked() {
@@ -367,8 +371,9 @@ fn settings_ui(
             ui.separator();
             ui.heading("Visualization");
             ui.checkbox(&mut viz.show_streamlines, "Streamlines");
-            ui.checkbox(&mut viz.color_by_speed, "Color by speed");
+            ui.checkbox(&mut viz.color_by_speed, "Color by speed (red = stagnation)");
             ui.checkbox(&mut viz.show_obstacle, "Show obstacle");
+            ui.checkbox(&mut viz.spin_wheels, "Spin wheels");
             ui.add(egui::Slider::new(&mut viz.density, 4..=24).text("Streamline density"));
             ui.add(
                 egui::Slider::new(&mut config.max_wind_height_mm, 100.0..=2400.0)
@@ -381,6 +386,40 @@ fn settings_ui(
         });
 
     pointer.0 = ctx.wants_pointer_input();
+}
+
+/// Spin imported wheels about the car's lateral axis at a rate proportional to
+/// wind speed. Wheels are found heuristically by node name (glTF `Name`).
+fn spin_wheels(
+    time: Res<Time>,
+    sim: Res<FluidSim>,
+    viz: Res<VizSettings>,
+    model: Option<Res<ModelPlacement>>,
+    mut wheels: Query<(&Name, &mut Transform, &GlobalTransform)>,
+) {
+    if !viz.spin_wheels || model.is_none() || !sim.running {
+        return;
+    }
+
+    // Visual spin rate (rad/s); scales with wind speed.
+    let dtheta = sim.wind_speed * 0.15 * time.delta_secs();
+    if dtheta.abs() < 1e-6 {
+        return;
+    }
+    // Wheels roll about the lateral (Z) axis — the flow runs along +X.
+    let dq_world = Quat::from_axis_angle(Vec3::Z, dtheta);
+
+    for (name, mut transform, global) in &mut wheels {
+        let n = name.as_str().to_ascii_lowercase();
+        if !(n.contains("wheel") || n.contains("tyre") || n.contains("tire") || n.contains("rim")) {
+            continue;
+        }
+        // Convert the world-space spin into this node's local frame so it spins
+        // correctly regardless of where it sits in the model hierarchy.
+        let parent_rot = global.rotation() * transform.rotation.inverse();
+        let delta_local = parent_rot.inverse() * dq_world * parent_rot;
+        transform.rotation = delta_local * transform.rotation;
+    }
 }
 
 /// Apply the obstacle show/hide toggle.

@@ -43,6 +43,9 @@ pub struct FluidSim {
     // User-tunable parameters.
     pub wind_speed: f32,
     pub viscosity: f32,
+    /// Vorticity-confinement strength — injects swirling turbulence, most
+    /// visible in the wake behind the obstacle.
+    pub turbulence: f32,
     pub running: bool,
 }
 
@@ -61,8 +64,9 @@ impl FluidSim {
             w0: vec![0.0; n],
             p: vec![0.0; n],
             div: vec![0.0; n],
-            wind_speed: 6.0,
+            wind_speed: 20.0,
             viscosity: 0.0,
+            turbulence: 0.5,
             running: true,
         }
     }
@@ -165,8 +169,85 @@ impl FluidSim {
         self.apply_inflow();
         self.enforce_obstacles(grid);
         self.project(grid);
+
+        // --- Turbulence (vorticity confinement) -----------------------------
+        if self.turbulence > 0.0 {
+            self.apply_turbulence(grid, dt);
+            self.enforce_obstacles(grid);
+            self.project(grid);
+        }
+
         self.apply_inflow();
         self.enforce_obstacles(grid);
+    }
+
+    /// Vorticity confinement: find each cell's local swirl (curl) and push
+    /// energy back into it, sharpening and sustaining eddies that numerical
+    /// diffusion would otherwise smear away. Scratch lives in the advection
+    /// buffers (`u0`/`v0`/`w0` hold the curl, `div` its magnitude).
+    fn apply_turbulence(&mut self, grid: &Grid3D, dt: f32) {
+        let (w, h, d) = (self.w, self.h, self.d);
+        if w < 3 || h < 3 || d < 3 {
+            return;
+        }
+        let idx = |x: usize, y: usize, z: usize| z * w * h + y * w + x;
+
+        // Curl of the velocity field.
+        for z in 1..d - 1 {
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    let i = idx(x, y, z);
+                    if grid.solid[i] {
+                        self.u0[i] = 0.0;
+                        self.v0[i] = 0.0;
+                        self.w0[i] = 0.0;
+                        self.div[i] = 0.0;
+                        continue;
+                    }
+                    let cx = (self.ws[idx(x, y + 1, z)] - self.ws[idx(x, y - 1, z)]
+                        - (self.v[idx(x, y, z + 1)] - self.v[idx(x, y, z - 1)]))
+                        * 0.5;
+                    let cy = (self.u[idx(x, y, z + 1)] - self.u[idx(x, y, z - 1)]
+                        - (self.ws[idx(x + 1, y, z)] - self.ws[idx(x - 1, y, z)]))
+                        * 0.5;
+                    let cz = (self.v[idx(x + 1, y, z)] - self.v[idx(x - 1, y, z)]
+                        - (self.u[idx(x, y + 1, z)] - self.u[idx(x, y - 1, z)]))
+                        * 0.5;
+                    self.u0[i] = cx;
+                    self.v0[i] = cy;
+                    self.w0[i] = cz;
+                    self.div[i] = (cx * cx + cy * cy + cz * cz).sqrt();
+                }
+            }
+        }
+
+        // Confinement force f = eps * (N x curl), N = normalized grad|curl|.
+        let eps = self.turbulence;
+        for z in 1..d - 1 {
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    let i = idx(x, y, z);
+                    if grid.solid[i] {
+                        continue;
+                    }
+                    let gx = (self.div[idx(x + 1, y, z)] - self.div[idx(x - 1, y, z)]) * 0.5;
+                    let gy = (self.div[idx(x, y + 1, z)] - self.div[idx(x, y - 1, z)]) * 0.5;
+                    let gz = (self.div[idx(x, y, z + 1)] - self.div[idx(x, y, z - 1)]) * 0.5;
+                    let mag = (gx * gx + gy * gy + gz * gz).sqrt() + 1e-5;
+                    let (nx, ny, nz) = (gx / mag, gy / mag, gz / mag);
+
+                    let (cx, cy, cz) = (self.u0[i], self.v0[i], self.w0[i]);
+                    // f = N x curl
+                    let fx = ny * cz - nz * cy;
+                    let fy = nz * cx - nx * cz;
+                    let fz = nx * cy - ny * cx;
+
+                    self.u[i] += eps * fx * dt;
+                    self.v[i] += eps * fy * dt;
+                    self.ws[i] += eps * fz * dt;
+                }
+            }
+        }
     }
 
     /// Drive the upwind face (and the cell behind it) at the chosen wind speed,
