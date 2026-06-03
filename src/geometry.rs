@@ -363,6 +363,14 @@ fn stage_into_assets(src: &std::path::Path) -> std::io::Result<String> {
         .unwrap_or_else(|| "model.glb".to_string());
     let dest_root = std::path::Path::new("assets/imported");
 
+    // If the picked file already lives under `assets/`, load it in place. This
+    // avoids a `fs::copy` of a file onto itself (which would truncate it to 0
+    // bytes) when the user selects something already inside the asset folder.
+    if let Some(rel) = path_within_assets(src) {
+        info!("Model is already under assets/, loading in place: {rel}");
+        return Ok(rel);
+    }
+
     let is_gltf = src
         .extension()
         .and_then(|e| e.to_str())
@@ -383,6 +391,15 @@ fn stage_into_assets(src: &std::path::Path) -> std::io::Result<String> {
         std::fs::copy(src, &dest)?;
         Ok(format!("imported/{file_name}"))
     }
+}
+
+/// If `src` resolves to a path inside the `assets/` directory, return the
+/// AssetServer-relative path (forward-slashed); otherwise `None`.
+fn path_within_assets(src: &std::path::Path) -> Option<String> {
+    let assets = std::fs::canonicalize("assets").ok()?;
+    let src = std::fs::canonicalize(src).ok()?;
+    let rel = src.strip_prefix(&assets).ok()?;
+    Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// Recursively copy a directory tree.
