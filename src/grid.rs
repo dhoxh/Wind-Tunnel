@@ -5,6 +5,12 @@ pub const GRID_HEIGHT: usize = 24;
 pub const GRID_DEPTH: usize = 24;
 pub const CELL_SIZE: f32 = 0.6;
 
+/// Reference obstacle height (mm) that ride-height is expressed relative to.
+/// Ride height is interpreted as a fraction of the obstacle's own height using
+/// this as a nominal full height, so "40 mm" reads like a real car's ground
+/// clearance regardless of the imported model's arbitrary scale.
+pub const REF_HEIGHT_MM: f32 = 1200.0;
+
 /// Static occupancy + scalar density grid for the wind tunnel domain.
 ///
 /// The grid is the shared "world" that the fluid solver writes velocity into
@@ -42,11 +48,12 @@ impl Grid3D {
         z * self.width * self.height + y * self.width + x
     }
 
-    /// World-space position of cell (0,0,0)'s center.
+    /// World-space position of cell (0,0,0)'s center. The bottom row sits so
+    /// its lower face aligns with the ground plane at `y = 0`.
     pub fn world_origin(&self) -> Vec3 {
         Vec3::new(
             -(self.width as f32 * CELL_SIZE) / 2.0,
-            0.5,
+            CELL_SIZE * 0.5,
             -(self.depth as f32 * CELL_SIZE) / 2.0,
         )
     }

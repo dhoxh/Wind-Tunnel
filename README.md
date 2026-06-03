@@ -14,10 +14,9 @@ This project focuses on interactive simulation and visual intuition rather than 
 cargo run --release
 ```
 
-Press **O** to import a `.glb`/`.gltf` model (e.g. from Sketchfab) into the
-tunnel, use `[` / `]` to change wind speed, and `P` / `B` / `C` to toggle the
-particles, obstacle, and speed coloring. The full control list is in
-[WINDFLOW.md](WINDFLOW.md).
+Use the **Wind Tunnel** settings panel (top-left) to import a `.glb`/`.gltf`
+model (e.g. from Sketchfab), set wind speed, ride height, heading, streamline
+density, and the FPS cap. The full control list is in [WINDFLOW.md](WINDFLOW.md).
 
 On Linux, building Bevy needs `libasound2-dev`, `libudev-dev`, and
 `libxkbcommon-dev`; macOS and Windows need nothing extra.

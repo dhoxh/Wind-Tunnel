@@ -1,7 +1,10 @@
+use std::time::{Duration, Instant};
+
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
 use bevy::window::PresentMode;
+use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 
 mod fluid;
 mod geometry;
@@ -9,7 +12,8 @@ mod grid;
 mod renderer;
 
 use fluid::FluidSim;
-use geometry::{ImportRequest, ObstacleViz};
+use geometry::{ImportRequest, ModelPlacement, ObstacleViz, PendingLoad};
+use grid::{CELL_SIZE, REF_HEIGHT_MM};
 use renderer::VizSettings;
 
 #[derive(Component)]
@@ -23,20 +27,59 @@ struct FlyCamera {
     sensitivity: f32,
 }
 
-/// Request flag: rebuild the default cube obstacle (used to clear an import).
+/// User-facing tunables that aren't part of the solver or visualization state.
+#[derive(Resource)]
+pub struct Config {
+    /// Obstacle ground clearance, in millimeters (relative to a nominal height).
+    pub ride_height_mm: f32,
+    /// Model heading about the vertical axis, in degrees. The default faces the
+    /// model into the oncoming wind.
+    pub model_yaw_deg: f32,
+    /// Frame-rate cap; `0` means uncapped. VSync is off so this governs pacing.
+    pub fps_cap: f32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ride_height_mm: 40.0,
+            model_yaw_deg: -90.0,
+            fps_cap: 144.0,
+        }
+    }
+}
+
+/// Request flag: rebuild the default cube obstacle (drops any imported model).
 #[derive(Resource, Default)]
-struct ResetObstacleRequest(bool);
+struct RestoreCubeRequest(bool);
+
+/// True while the active obstacle is the built-in cube (not an imported model).
+#[derive(Resource, Default)]
+struct ObstacleIsCube(bool);
+
+/// Set each frame from egui so world interactions ignore clicks over the UI.
+#[derive(Resource, Default)]
+struct PointerOverUi(bool);
+
+/// Tracks wall-clock time for the frame-rate limiter.
+#[derive(Resource)]
+struct FrameLimiter {
+    last: Instant,
+}
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "RustFlow — Interactive Wind Tunnel".into(),
-                present_mode: PresentMode::AutoVsync,
+                // VSync off; pacing is handled by the FPS-cap slider.
+                present_mode: PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()
         }))
+        .add_plugins(EguiPlugin::default())
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .insert_resource(grid::Grid3D::new(
             grid::GRID_WIDTH,
             grid::GRID_HEIGHT,
@@ -47,21 +90,16 @@ fn main() {
             grid::GRID_HEIGHT,
             grid::GRID_DEPTH,
         ))
+        .insert_resource(FrameLimiter { last: Instant::now() })
         .init_resource::<VizSettings>()
+        .init_resource::<Config>()
         .init_resource::<ImportRequest>()
-        .init_resource::<ResetObstacleRequest>()
-        .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .init_resource::<RestoreCubeRequest>()
+        .init_resource::<ObstacleIsCube>()
+        .init_resource::<PointerOverUi>()
         .add_systems(
             Startup,
-            (
-                setup_3d,
-                seed_cube_obstacle,
-                spawn_voxel_obstacle,
-                renderer::setup_particles,
-                spawn_fps_counter,
-                spawn_hud,
-            )
-                .chain(),
+            (setup_3d, spawn_default_cube, spawn_fps_counter).chain(),
         )
         .add_systems(
             Update,
@@ -71,14 +109,16 @@ fn main() {
                 update_fps,
                 handle_controls,
                 step_fluid,
-                renderer::update_particles,
+                renderer::draw_streamlines,
                 geometry::handle_import_request,
-                geometry::process_pending_import,
-                handle_reset_obstacle,
+                geometry::process_loading,
+                geometry::apply_placement,
+                manage_cube,
                 toggle_obstacle_visibility,
-                update_hud,
             ),
         )
+        .add_systems(EguiPrimaryContextPass, settings_ui)
+        .add_systems(Last, frame_limiter)
         .run();
 }
 
@@ -107,6 +147,7 @@ fn setup_3d(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, -0.8, 0.0)),
     ));
 
+    // Ground plane at y = 0 (the tunnel floor).
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(60.0, 60.0))),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -118,37 +159,37 @@ fn setup_3d(
     ));
 }
 
-/// Seed the default block obstacle into the solid grid.
-fn seed_cube_obstacle(mut grid: ResMut<grid::Grid3D>) {
-    let cx = grid.width / 3;
-    let cy = grid.height / 2;
-    let cz = grid.depth / 2;
-    let r = 3;
+/// Number of cells the default cube spans in each axis.
+const CUBE_CELLS: usize = 6;
 
-    for z in cz.saturating_sub(r)..=(cz + r).min(grid.depth - 1) {
-        for y in cy.saturating_sub(r)..=(cy + r).min(grid.height - 1) {
-            for x in cx.saturating_sub(r)..=(cx + r).min(grid.width - 1) {
-                let idx = grid.index(x, y, z);
-                grid.density[idx] = 1.0;
-                grid.solid[idx] = true;
+/// Seed the default cube into the grid and render its voxels, sitting on the
+/// ground at the configured ride height.
+fn build_cube(
+    commands: &mut Commands,
+    grid: &mut grid::Grid3D,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    ride_mm: f32,
+) {
+    let cube_h_world = CUBE_CELLS as f32 * CELL_SIZE;
+    let gap_world = (ride_mm / REF_HEIGHT_MM) * cube_h_world;
+    let start_y = (gap_world / CELL_SIZE).round() as usize;
+
+    let cx = grid.width / 3;
+    let cz = grid.depth / 2;
+    let x0 = cx.saturating_sub(CUBE_CELLS / 2);
+    let z0 = cz.saturating_sub(CUBE_CELLS / 2);
+
+    for y in start_y..(start_y + CUBE_CELLS).min(grid.height) {
+        for z in z0..(z0 + CUBE_CELLS).min(grid.depth) {
+            for x in x0..(x0 + CUBE_CELLS).min(grid.width) {
+                let i = grid.index(x, y, z);
+                grid.solid[i] = true;
             }
         }
     }
-}
 
-/// Render one red cube per solid cell (only used for the default obstacle).
-fn spawn_voxel_obstacle(
-    mut commands: Commands,
-    grid: Res<grid::Grid3D>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let voxel_mesh = meshes.add(Cuboid::new(
-        grid::CELL_SIZE,
-        grid::CELL_SIZE,
-        grid::CELL_SIZE,
-    ));
-
+    let voxel_mesh = meshes.add(Cuboid::new(CELL_SIZE, CELL_SIZE, CELL_SIZE));
     let voxel_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.8, 0.2, 0.2),
         perceptual_roughness: 0.95,
@@ -158,8 +199,7 @@ fn spawn_voxel_obstacle(
     for z in 0..grid.depth {
         for y in 0..grid.height {
             for x in 0..grid.width {
-                let i = grid.index(x, y, z);
-                if grid.solid[i] {
+                if grid.solid[grid.index(x, y, z)] {
                     commands.spawn((
                         Voxel,
                         ObstacleViz,
@@ -173,19 +213,85 @@ fn spawn_voxel_obstacle(
     }
 }
 
+fn spawn_default_cube(
+    mut commands: Commands,
+    mut grid: ResMut<grid::Grid3D>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    config: Res<Config>,
+    mut is_cube: ResMut<ObstacleIsCube>,
+) {
+    build_cube(
+        &mut commands,
+        &mut grid,
+        &mut meshes,
+        &mut materials,
+        config.ride_height_mm,
+    );
+    is_cube.0 = true;
+}
+
+/// Rebuild the cube on explicit request, or when ride height changes while the
+/// cube (not a model) is the active obstacle.
+fn manage_cube(
+    mut commands: Commands,
+    mut grid: ResMut<grid::Grid3D>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    config: Res<Config>,
+    mut restore: ResMut<RestoreCubeRequest>,
+    mut is_cube: ResMut<ObstacleIsCube>,
+    model: Option<Res<ModelPlacement>>,
+    pending: Option<Res<PendingLoad>>,
+    obstacles: Query<Entity, With<ObstacleViz>>,
+    mut last_ride: Local<f32>,
+) {
+    let restore_now = restore.0;
+    restore.0 = false;
+    let model_active = model.is_some() || pending.is_some();
+
+    if restore_now {
+        commands.remove_resource::<ModelPlacement>();
+        commands.remove_resource::<PendingLoad>();
+    } else if model_active {
+        is_cube.0 = false;
+        return;
+    }
+
+    let ride_changed = (config.ride_height_mm - *last_ride).abs() > 1e-3;
+    let build = restore_now || (is_cube.0 && ride_changed);
+    if !build {
+        return;
+    }
+
+    for e in &obstacles {
+        commands.entity(e).despawn();
+    }
+    grid.clear_solids();
+    build_cube(
+        &mut commands,
+        &mut grid,
+        &mut meshes,
+        &mut materials,
+        config.ride_height_mm,
+    );
+    is_cube.0 = true;
+    *last_ride = config.ride_height_mm;
+}
+
 /// Advance the Navier–Stokes solver each frame.
 fn step_fluid(mut sim: ResMut<FluidSim>, grid: Res<grid::Grid3D>, time: Res<Time>) {
     let dt = time.delta_secs();
     sim.step(&grid, dt);
 }
 
-/// Keyboard controls for the simulation and visualization toggles.
+/// Keyboard shortcuts that mirror the settings menu.
 fn handle_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut sim: ResMut<FluidSim>,
     mut viz: ResMut<VizSettings>,
     mut import: ResMut<ImportRequest>,
-    mut reset_obstacle: ResMut<ResetObstacleRequest>,
+    mut restore: ResMut<RestoreCubeRequest>,
 ) {
     if keys.just_pressed(KeyCode::Enter) {
         sim.running = !sim.running;
@@ -193,20 +299,8 @@ fn handle_controls(
     if keys.just_pressed(KeyCode::KeyR) {
         sim.reset();
     }
-    if keys.just_pressed(KeyCode::BracketRight) {
-        sim.wind_speed = (sim.wind_speed + 1.0).min(25.0);
-    }
-    if keys.just_pressed(KeyCode::BracketLeft) {
-        sim.wind_speed = (sim.wind_speed - 1.0).max(0.0);
-    }
-    if keys.just_pressed(KeyCode::Period) {
-        sim.viscosity = (sim.viscosity + 0.1).min(5.0);
-    }
-    if keys.just_pressed(KeyCode::Comma) {
-        sim.viscosity = (sim.viscosity - 0.1).max(0.0);
-    }
     if keys.just_pressed(KeyCode::KeyP) {
-        viz.show_particles = !viz.show_particles;
+        viz.show_streamlines = !viz.show_streamlines;
     }
     if keys.just_pressed(KeyCode::KeyB) {
         viz.show_obstacle = !viz.show_obstacle;
@@ -218,72 +312,72 @@ fn handle_controls(
         import.0 = true;
     }
     if keys.just_pressed(KeyCode::KeyX) {
-        reset_obstacle.0 = true;
+        restore.0 = true;
     }
 }
 
-/// Rebuild the default cube obstacle when the user clears an imported model.
-fn handle_reset_obstacle(
-    mut request: ResMut<ResetObstacleRequest>,
-    mut commands: Commands,
-    mut grid: ResMut<grid::Grid3D>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    obstacles: Query<Entity, With<ObstacleViz>>,
+/// The egui settings panel.
+fn settings_ui(
+    mut contexts: EguiContexts,
+    mut sim: ResMut<FluidSim>,
+    mut viz: ResMut<VizSettings>,
+    mut config: ResMut<Config>,
+    mut import: ResMut<ImportRequest>,
+    mut restore: ResMut<RestoreCubeRequest>,
+    mut pointer: ResMut<PointerOverUi>,
 ) {
-    if !request.0 {
+    let Ok(ctx) = contexts.ctx_mut() else {
         return;
-    }
-    request.0 = false;
+    };
 
-    for e in &obstacles {
-        commands.entity(e).despawn();
-    }
-    grid.clear_solids();
-
-    // Re-seed and re-render the default block.
-    let cx = grid.width / 3;
-    let cy = grid.height / 2;
-    let cz = grid.depth / 2;
-    let r = 3;
-    for z in cz.saturating_sub(r)..=(cz + r).min(grid.depth - 1) {
-        for y in cy.saturating_sub(r)..=(cy + r).min(grid.height - 1) {
-            for x in cx.saturating_sub(r)..=(cx + r).min(grid.width - 1) {
-                let idx = grid.index(x, y, z);
-                grid.solid[idx] = true;
-            }
-        }
-    }
-
-    let voxel_mesh = meshes.add(Cuboid::new(
-        grid::CELL_SIZE,
-        grid::CELL_SIZE,
-        grid::CELL_SIZE,
-    ));
-    let voxel_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.8, 0.2, 0.2),
-        perceptual_roughness: 0.95,
-        ..default()
-    });
-    for z in 0..grid.depth {
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let i = grid.index(x, y, z);
-                if grid.solid[i] {
-                    commands.spawn((
-                        Voxel,
-                        ObstacleViz,
-                        Mesh3d(voxel_mesh.clone()),
-                        MeshMaterial3d(voxel_material.clone()),
-                        Transform::from_translation(grid.cell_to_world(x, y, z)),
-                    ));
+    egui::Window::new("Wind Tunnel")
+        .default_pos(egui::pos2(12.0, 12.0))
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.heading("Airflow");
+            ui.add(egui::Slider::new(&mut sim.wind_speed, 0.0..=30.0).text("Speed (m/s)"));
+            ui.add(egui::Slider::new(&mut sim.viscosity, 0.0..=5.0).text("Viscosity"));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut sim.running, "Run");
+                if ui.button("Reset flow").clicked() {
+                    sim.reset();
                 }
-            }
-        }
-    }
+            });
+
+            ui.separator();
+            ui.heading("Model");
+            ui.add(
+                egui::Slider::new(&mut config.ride_height_mm, 20.0..=150.0)
+                    .text("Ride height (mm)"),
+            );
+            ui.add(
+                egui::Slider::new(&mut config.model_yaw_deg, -180.0..=180.0).text("Heading (deg)"),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Import GLB / glTF…").clicked() {
+                    import.0 = true;
+                }
+                if ui.button("Restore cube").clicked() {
+                    restore.0 = true;
+                }
+            });
+
+            ui.separator();
+            ui.heading("Visualization");
+            ui.checkbox(&mut viz.show_streamlines, "Streamlines");
+            ui.checkbox(&mut viz.color_by_speed, "Color by speed");
+            ui.checkbox(&mut viz.show_obstacle, "Show obstacle");
+            ui.add(egui::Slider::new(&mut viz.density, 4..=24).text("Streamline density"));
+
+            ui.separator();
+            ui.heading("Performance");
+            ui.add(egui::Slider::new(&mut config.fps_cap, 30.0..=300.0).text("FPS cap"));
+        });
+
+    pointer.0 = ctx.wants_pointer_input();
 }
 
-/// Apply the obstacle show/hide toggle to all obstacle entities.
+/// Apply the obstacle show/hide toggle.
 fn toggle_obstacle_visibility(
     viz: Res<VizSettings>,
     mut query: Query<&mut Visibility, With<ObstacleViz>>,
@@ -300,12 +394,26 @@ fn toggle_obstacle_visibility(
     }
 }
 
+/// Limit the frame rate to `Config::fps_cap` (VSync is off).
+fn frame_limiter(mut limiter: ResMut<FrameLimiter>, config: Res<Config>) {
+    if config.fps_cap > 0.0 {
+        let target = Duration::from_secs_f32(1.0 / config.fps_cap);
+        let elapsed = limiter.last.elapsed();
+        if elapsed < target {
+            std::thread::sleep(target - elapsed);
+        }
+    }
+    limiter.last = Instant::now();
+}
+
 fn camera_look(
     mut mouse_motion_events: MessageReader<MouseMotion>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
+    pointer: Res<PointerOverUi>,
     mut query: Query<(&mut Transform, &mut FlyCamera)>,
 ) {
-    if !mouse_buttons.pressed(MouseButton::Left) {
+    // Don't rotate the camera when the user is dragging in the settings panel.
+    if pointer.0 || !mouse_buttons.pressed(MouseButton::Left) {
         mouse_motion_events.clear();
         return;
     }
@@ -400,50 +508,4 @@ fn update_fps(diagnostics: Res<DiagnosticsStore>, mut query: Query<&mut Text, Wi
     {
         *text = Text::new(format!("FPS: {:.0}", fps));
     }
-}
-
-#[derive(Component)]
-struct HudText;
-
-fn spawn_hud(mut commands: Commands) {
-    commands.spawn((
-        Text::new(""),
-        TextFont {
-            font_size: 15.0,
-            ..default()
-        },
-        TextColor(Color::srgb(0.85, 0.9, 1.0)),
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(10.0),
-            top: Val::Px(10.0),
-            ..default()
-        },
-        HudText,
-    ));
-}
-
-fn update_hud(
-    sim: Res<FluidSim>,
-    viz: Res<VizSettings>,
-    mut query: Query<&mut Text, With<HudText>>,
-) {
-    let Ok(mut text) = query.single_mut() else {
-        return;
-    };
-    let on = |b: bool| if b { "ON" } else { "OFF" };
-    *text = Text::new(format!(
-        "RustFlow — Wind Tunnel\n\
-         Wind speed: {:.1} m/s   ( [ / ] )      Viscosity: {:.1}   ( , / . )\n\
-         Simulation: {}   (Enter)    Reset flow: R\n\
-         Particles: {} (P)   Obstacle: {} (B)   Color-by-speed: {} (C)\n\
-         O: import 3D model (GLB/glTF)    X: restore default block\n\
-         Camera: WASD move, Space/Shift up-down, hold Left-Mouse to look",
-        sim.wind_speed,
-        sim.viscosity,
-        if sim.running { "RUNNING" } else { "PAUSED" },
-        on(viz.show_particles),
-        on(viz.show_obstacle),
-        on(viz.color_by_speed),
-    ));
 }
